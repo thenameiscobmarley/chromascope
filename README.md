@@ -4,20 +4,35 @@ Live colour detection on your screen for Wayland / KDE Plasma. The UI is built w
 
 **Install:** run `./setup.sh`. It installs the system packages and Python dependencies, then adds ChromaScope and its icon to the app menu. `./setup.sh --uninstall` takes them out again.
 
-After that, open **ChromaScope** from the app menu or run `./run.sh`. Pass `--start` to begin capturing as soon as it opens.
+After that, open **ChromaScope** from the app menu or run `./run.sh`. Pass `--start` to begin capturing as soon as it opens. The first launch shows a short tour; you can replay it from Setup → Help.
 
-* **Capture:** xdg-desktop-portal ScreenCast → PipeWire → GStreamer. KDE asks which screen to share the first time, and the app remembers your choice after that.
-* **Detect:** find up to 6 colours at once, each with its own name, box colour and on/off switch. Double-click a colour to rename it. You can set a colour from a preset, a custom colour, or **Sample from preview**: drag a box over the thing you want and its hue, saturation and brightness range is worked out from those pixels. Also: minimum size, merge distance, max boxes and sort order.
-* **Profiles:** save and load named setups (colours, FOV, drawing). They're stored in `~/.config/chromascope/profiles/`.
+## Tabs
+
+* **Detect:** find up to 6 colours at once, each with its own name, box colour and on/off switch. Double-click a colour to rename it. Set a colour from a preset, a custom colour, or **Sample from preview**: drag a box over the thing you want and its hue, saturation and brightness range is worked out from those pixels. Saved profiles live at the top of this tab.
 * **FOV:** drag the ring in the preview to move it, or drag its edge to resize it. Shapes are circle, square or full screen, and you can save named regions. Large areas are scanned at half resolution to keep it fast.
-* **Draw:** Box / Glow (detected pixels turn a red shade with a halo) / Both / Corners / None, plus glow radius, thickness, labels and HUD.
-* **Colour-blind assist:** recolours the detected colours with stripes, a solid fill or an outline in a colour you pick. With the FOV set to full screen and "Show on main screen" on, it works over every app.
-* **Screen:** shows the overlay on your main screen. It's click-through and stays on top through a KWin rule. You also pick the monitor, monitor or window capture, the cursor setting, and whether the app minimizes while it captures.
+* **Draw:** Box / Glow / Both / Corners / None, plus glow radius, thickness, labels and HUD.
+  * **Colour-blind assist** recolours the detected colours with stripes, a solid fill or an outline. With the FOV set to full screen and "Show on main screen" on, it works over every app.
+* **Tools:**
+  * **Eyedropper:** a magnifier over the preview showing HEX / RGB / HSV and a plain colour name. Click a pixel to copy it; picks are kept in a history, and "Add as target" turns one into a colour to find.
+  * **Contrast checker:** pick a text colour and a background colour from the screen to get the WCAG ratio with AA / AAA pass or fail, plus a live text sample.
+  * **Palette:** the 8 main colours in the FOV, each with a share percentage, a name and "+ Add".
+* **Setup:**
+  * **Overlay:** draws on your real screen. It's click-through, stays on top and is hidden from the capture.
+  * **Capture:** monitor or window, cursor on or off, and minimize while capturing.
+  * **Auto-pause:** while the screen is locked, after the screen stops changing for a set time, or while a chosen app isn't focused. A tiny KWin script reports the focused app.
+  * **Share profiles:** export or import a file, copy or paste a short `CSP1:` share code, or add the example profiles (traffic lights, status LEDs, red for colour-blind eyes, highlighter yellow).
+  * **Look:** 18 UI Vault kits and 87 themes. The default is win98 controls on the paper theme.
 * **NNMM:** empty placeholder tab.
-* **Look:** defaults to win98 controls on the paper theme. All 18 UI Vault kits and 87 themes are available.
-* **No feedback:** KWin rules (`chromascope-overlay`, `chromascope-window`) leave both the overlay and the app window out of the screen capture. They're on screen, but the detector never sees its own boxes, swatches or preview.
-* Keys: F8 starts or stops capture, F9 turns the overlay on or off, F10 switches the preview between Screen, FOV zoom and Mask.
 
-Settings are saved in `~/.config/chromascope/settings.json`.
+**Undo / redo** (↶ ↷, Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y) covers every detection, FOV and drawing change, and each tab has **Reset this tab**.
 
-Files: `capture.py` (portal + stream), `detect.py` (HSV mask → boxes, glow tint) and `app.py` (UI, overlay).
+Keys: F8 starts or stops capture, F9 turns the overlay on or off, F10 switches the preview between Screen, FOV zoom and Mask, and Esc leaves sampling or the eyedropper.
+
+## How it works
+
+* **Capture:** xdg-desktop-portal ScreenCast → PipeWire → GStreamer. KDE asks which screen to share the first time and the app remembers your choice.
+* **No feedback:** KWin rules (`chromascope-overlay`, `chromascope-window`) keep both the overlay and the app window out of the screen capture. They're on screen, but the detector never sees its own boxes, swatches or preview.
+
+Settings are saved in `~/.config/chromascope/` (`settings.json`, `profiles/`).
+
+Files: `capture.py` (portal + stream), `detect.py` (HSV masks → boxes, sampling, glow, assist layer), `tools.py` (colour info and names, contrast, palette, share codes), `extras.py` (undo, auto-pause watchers, tour, example profiles) and `app.py` (UI, overlay).

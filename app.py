@@ -16,12 +16,14 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
-from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
-                               QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QInputDialog,
+                               QLabel, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
 import uivault3 as uv
+import tools
 from capture import MONITOR, WINDOW, Capture
 from detect import assist_layer, detect, fov_rect, hsv_of, sample, tint
+from extras import EXAMPLES, FocusWatcher, LockWatcher, Tour, UndoStack
 
 CONFIG = Path.home() / ".config" / "chromascope"
 PROFILES = CONFIG / "profiles"
@@ -38,11 +40,20 @@ DEFAULTS = {
     "view": "full", "hud": True, "max_fps": 60,
     "overlay": False, "overlay_fov": True, "overlay_fps": True, "overlay_screen": 0,
     "source": MONITOR, "cursor": False, "minimize": False, "restore_token": None,
-    "kit": "win98", "theme": "paper", "profile": "",
+    "pause_locked": True, "pause_static": False, "pause_static_s": 30, "pause_focus": False, "focus_match": "",
+    "history": [], "contrast_a": "#1a1917", "contrast_b": "#f4f2ee",
+    "kit": "win98", "theme": "paper", "profile": "", "toured": False,
 }
 # what a profile stores: everything about what to find and how to draw it, not window/capture/theme settings
 PROFILE_KEYS = ["colors", "sel", "min_area", "merge", "max_targets", "sort", "fov", "fov_shape", "fov_dx", "fov_dy",
                 "show_fov", "crosshair", "mode", "thickness", "glow", "labels", "assist", "assist_style", "assist_color", "max_fps"]
+UNDO_KEYS = PROFILE_KEYS + ["regions"]
+# what "Reset this tab" puts back, per tab
+RESET_KEYS = {"Detect": ["colors", "sel", "tolerance", "min_sat", "min_val", "min_area", "merge", "max_targets", "sort"],
+              "FOV": ["fov", "fov_shape", "fov_dx", "fov_dy", "show_fov", "crosshair", "max_fps"],
+              "Draw": ["mode", "thickness", "glow", "labels", "hud", "assist", "assist_style", "assist_color"],
+              "Setup": ["overlay_fov", "overlay_fps", "overlay_screen", "source", "cursor", "minimize",
+                        "pause_locked", "pause_static", "pause_static_s", "pause_focus", "focus_match"]}
 PRESETS = [("Red", "#ff2a2a"), ("Orange", "#ff8a00"), ("Yellow", "#ffe100"), ("Green", "#22e35a"),
            ("Cyan", "#00e5ff"), ("Blue", "#2a6bff"), ("Purple", "#b13cff"), ("Magenta", "#ff2ad4")]
 BOX_COLORS = [("Red", "#ff3b3b"), ("Lime", "#7CFF4F"), ("White", "#ffffff"), ("Cyan", "#2ae6ff"), ("Gold", "#ffc83a"), ("Pink", "#ff4fd8")]
@@ -101,10 +112,11 @@ class Engine(QThread):
     frameReady = Signal(object)
     failed = Signal(str)
     started_ok = Signal()
+    pausedChanged = Signal(str)           # "" = running, otherwise why it's paused
 
     def __init__(self, cfg):
         super().__init__()
-        self.cfg, self.cap, self.last_frame = cfg, Capture(), None
+        self.cfg, self.cap, self.last_frame, self.reason = cfg, Capture(), None, ""
         self.overlay_scale = 1.0          # overlay logical px per frame px (set by the UI)
 
     def start_capture(self):
@@ -125,16 +137,23 @@ class Engine(QThread):
 
     def run(self):
         last, prev, n, t0, fps, next_t = 0, [], 0, time.monotonic(), 0.0, 0.0
+        sig, changed_at = None, time.monotonic()
         while not self.isInterruptionRequested():
             if self.cap.error: self.failed.emit(self.cap.error); return
             frame, last = self.cap.wait(last, 0.3)
             if frame is None: continue
             now = time.monotonic()
             cfg = dict(self.cfg); cfg["colors"] = [dict(c) for c in cfg["colors"]]
+            self.last_frame = frame
+            # auto-pause: reasons from the UI (lock, focus) or a screen that hasn't changed for a while
+            s = frame[::24, ::24, :3]
+            if sig is None or s.shape != sig.shape or not np.array_equal(s, sig): sig, changed_at = s.copy(), now
+            reason = cfg.get("_pause") or ("screen hasn't changed" if cfg["pause_static"] and now - changed_at > cfg["pause_static_s"] else "")
+            if reason != self.reason: self.reason = reason; self.pausedChanged.emit(reason)
+            if reason: continue
             if now < next_t: time.sleep(next_t - now)
             next_t = time.monotonic() + 1.0 / max(1, cfg["max_fps"])
             t = time.perf_counter()
-            self.last_frame = frame
             targets, mask, fov = detect(frame, cfg, self._ignore(prev, cfg))
             img, src = self._preview(frame, mask, fov, cfg)
             assist = None
@@ -222,10 +241,13 @@ def draw_fov(p, fov, to_px, cfg, ring_pad=0, active=False):
 class Preview(QWidget):
     sampled = Signal(int, int, int, int)     # frame px rect dragged (or clicked) while sampling
     fovMoved = Signal()                      # the FOV was dragged / resized (cfg already updated)
+    picked = Signal(int, int)                # eyedropper click, frame px
 
     def __init__(self, cfg):
         super().__init__()
-        self.cfg, self.data, self.sampling = cfg, None, False
+        self.cfg, self.data, self.sampling, self.eyedrop = cfg, None, False, False
+        self.pixel = None                    # callable (x, y) -> (rgb, 11x11 RGB crop) | None, set by the window
+        self.hover, self.paused = None, ""
         self.drag = None                     # ("sample", start QPointF, cur QPointF) | ("move"/"size", …)
         self.setMinimumSize(480, 300); self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
@@ -290,8 +312,17 @@ class Preview(QWidget):
             r = QRectF(g.x() + 10, g.y() + 10, p.fontMetrics().horizontalAdvance(txt) + 18, 24)
             p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 170)); p.drawRoundedRect(r, 7, 7)
             p.setPen(QColor("#7CFF9B") if d["fps"] >= 30 else QColor("#FFD25A")); p.drawText(r, Qt.AlignCenter, txt)
-        if self.sampling:
+        if self.paused:
+            f = QFont("Geist Mono"); f.setPixelSize(13); f.setBold(True); p.setFont(f)
+            txt = f"PAUSED: {self.paused}"
+            r = QRectF(g.center().x() - 200, g.center().y() - 16, 400, 32)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 200)); p.drawRoundedRect(r, 8, 8)
+            p.setPen(QColor("#FFD25A")); p.drawText(r, Qt.AlignCenter, txt)
+        if self.eyedrop and self.hover is not None and self.pixel and g.contains(self.hover):
+            self._loupe(p, self.hover)
+        if self.sampling or self.eyedrop:
             p.setPen(QPen(tok("accent"), 2)); p.setBrush(Qt.NoBrush); p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 14, 14)
+        if self.sampling:
             if self.drag and self.drag[0] == "sample":
                 sel = QRectF(self.drag[1], self.drag[2]).normalized()
                 p.setPen(QPen(QColor("#ffffff"), 1.5, Qt.DashLine)); p.setBrush(QColor(255, 255, 255, 40)); p.drawRect(sel)
@@ -303,9 +334,39 @@ class Preview(QWidget):
                 p.setPen(QColor("#ffffff")); p.drawText(r, Qt.AlignCenter, txt)
         p.end()
 
+    def _loupe(self, p, pt):
+        """Magnified pixels round the cursor plus the colour's HEX / RGB / HSV / name."""
+        got = self.pixel(*(int(v) for v in self._to_frame(pt)))
+        if not got: return
+        rgb, crop = got
+        z, n = 8, crop.shape[0]
+        img = QImage(np.ascontiguousarray(crop).data, crop.shape[1], n, crop.strides[0], QImage.Format_RGB888).copy()
+        x = pt.x() + 18 if pt.x() + 18 + n * z + 190 < self.width() else pt.x() - 18 - n * z - 190
+        y = max(6, min(self.height() - n * z - 6, pt.y() - n * z / 2))
+        box = QRectF(x, y, n * z, n * z)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False); p.drawImage(box, img)
+        p.setPen(QPen(QColor("#ffffff"), 1.5)); p.setBrush(Qt.NoBrush); p.drawRect(box)
+        c = QRectF(box.x() + (n // 2) * z, box.y() + (n // 2) * z, z, z)
+        p.setPen(QPen(QColor("#000000"), 2)); p.drawRect(c.adjusted(-1, -1, 1, 1)); p.setPen(QPen(QColor("#ffffff"), 1)); p.drawRect(c)
+        i = tools.info(rgb)
+        f = QFont("Geist Mono"); f.setPixelSize(12); f.setBold(True); p.setFont(f)
+        card = QRectF(box.right() + 6, box.y(), 184, 86)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 215)); p.drawRoundedRect(card, 7, 7)
+        p.setBrush(QColor(*rgb)); p.drawRoundedRect(QRectF(card.x() + 8, card.y() + 8, 22, 22), 4, 4)
+        p.setPen(QColor("#ffffff")); p.drawText(QRectF(card.x() + 38, card.y() + 8, 140, 22), Qt.AlignVCenter, i["hex"])
+        f.setBold(False); f.setPixelSize(11); p.setFont(f); p.setPen(QColor("#d8d8d8"))
+        for k, key in enumerate(("rgb", "hsv", "name")):
+            p.drawText(QRectF(card.x() + 8, card.y() + 36 + k * 15, 172, 15), Qt.AlignVCenter, i[key])
+
+    def leaveEvent(self, _):
+        if self.hover is not None: self.hover = None; self.update()
+
     def mousePressEvent(self, e):
         if not self.data or e.button() != Qt.LeftButton: return
         pt = e.position()
+        if self.eyedrop:
+            if self._geom().contains(pt) and self.cfg["view"] != "mask": self.picked.emit(*(int(v) for v in self._to_frame(pt)))
+            return
         if self.sampling and self.cfg["view"] != "mask":
             if self._geom().contains(pt): self.drag = ("sample", pt, pt)
             return
@@ -316,6 +377,8 @@ class Preview(QWidget):
 
     def mouseMoveEvent(self, e):
         pt = e.position()
+        if self.eyedrop:
+            self.hover = pt; self.setCursor(Qt.CrossCursor); self.update(); return
         if not self.drag:
             hit = None if self.sampling else self._hit(pt)
             self.setCursor(Qt.CrossCursor if self.sampling else Qt.SizeFDiagCursor if hit == "size"
@@ -467,7 +530,11 @@ class Panel(QWidget):
     def set(self, key, value):
         self.cfg[key] = value; self.changed(key)
 
-    def end(self): self.lay.addStretch(1)
+    def end(self, reset=None):
+        self.lay.addStretch(1)
+        if reset:
+            b = uv.Button("Reset this tab", size="sm"); b.setToolTip("Put this tab's settings back to defaults (undo with Ctrl+Z)")
+            b.clicked.connect(reset); self.lay.addWidget(b, 0, Qt.AlignLeft)
 
 
 class Swatch(QWidget):
@@ -512,20 +579,50 @@ class ColorRow(QWidget):
     def mouseDoubleClickEvent(self, _): self.renamed.emit()
 
 
+# ── Tools widgets ────────────────────────────────────────────────────────────
+class ContrastSample(QWidget):
+    """Shows text colour A on background B, big and small, like the WCAG checks."""
+
+    def __init__(self):
+        super().__init__(); self.a, self.b = "#000000", "#ffffff"; self.setFixedHeight(64)
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(0, 0, 0, 60), 1)); p.setBrush(QColor(self.b)); p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 6, 6)
+        p.setPen(QColor(self.a)); f = p.font(); f.setPixelSize(26); f.setBold(True); p.setFont(f)
+        p.drawText(QRectF(14, 0, 60, self.height()), Qt.AlignVCenter, "Aa")
+        f.setPixelSize(13); f.setBold(False); p.setFont(f)
+        p.drawText(QRectF(80, 0, self.width() - 90, self.height()), Qt.AlignVCenter | Qt.TextWordWrap, "The quick brown fox jumps over the lazy dog.")
+        p.end()
+
+
 # ── Main window ──────────────────────────────────────────────────────────────
+TABS = ["Detect", "FOV", "Draw", "Tools", "Setup", "NNMM"]
+
+
 class Window(uv.Surface):
     def __init__(self, app):
         super().__init__()
         self.app, self.cfg = app, load_settings()
         self.engine, self.overlay, self.running = None, Overlay(self.cfg), False
-        self.reg = {}
+        self.reg, self.restoring, self.pick_for, self.eye_rgb = {}, False, None, None
         self.setWindowTitle("ChromaScope"); self.resize(1240, 720); self.setMinimumSize(980, 600)
         self.restyle_app()
+
+        self.history = UndoStack()
+        self.undo_timer = QTimer(self); self.undo_timer.setSingleShot(True); self.undo_timer.setInterval(500)
+        self.undo_timer.timeout.connect(self.commit_undo)
+        self.lock = LockWatcher(); self.lock.changed.connect(lambda _l: self.update_pause())
+        self.focus = FocusWatcher(CONFIG); self.focus.changed.connect(lambda *_: self.update_pause())
 
         root = QVBoxLayout(self); root.setContentsMargins(22, 14, 22, 16); root.setSpacing(12)
         head = QHBoxLayout(); root.addLayout(head)
         head.addWidget(uv.Heading("ChromaScope", 34))
         self.status = uv.Badge("Idle", "warn"); head.addWidget(self.status, 0, Qt.AlignVCenter)
+        self.undo_box = QWidget(); ub = QHBoxLayout(self.undo_box); ub.setContentsMargins(8, 0, 0, 0); ub.setSpacing(4)
+        self.undo_btn = uv.Button("↶", size="sm"); self.undo_btn.setToolTip("Undo (Ctrl+Z)"); self.undo_btn.clicked.connect(self.undo)
+        self.redo_btn = uv.Button("↷", size="sm"); self.redo_btn.setToolTip("Redo (Ctrl+Shift+Z)"); self.redo_btn.clicked.connect(self.redo)
+        ub.addWidget(self.undo_btn); ub.addWidget(self.redo_btn); head.addWidget(self.undo_box, 0, Qt.AlignVCenter)
         head.addStretch(1)
         self.view_tabs = uv.TabBar(["Screen", "FOV zoom", "Mask"]); self.view_tabs.setUsesScrollButtons(False)
         self.view_tabs.setCurrentIndex(["full", "fov", "mask"].index(self.cfg["view"]))
@@ -537,8 +634,8 @@ class Window(uv.Surface):
 
         body = QHBoxLayout(); body.setSpacing(16); root.addLayout(body, 1)
         left = QVBoxLayout(); left.setSpacing(10); body.addLayout(left, 1)
-        self.preview = Preview(self.cfg)
-        self.preview.sampled.connect(self.sample_at); self.preview.fovMoved.connect(self.fov_moved)
+        self.preview = Preview(self.cfg); self.preview.pixel = self.pixel_at
+        self.preview.sampled.connect(self.sample_at); self.preview.fovMoved.connect(self.fov_moved); self.preview.picked.connect(self.eye_picked)
         left.addWidget(self.preview, 1)
         stats = QHBoxLayout(); stats.setSpacing(6); left.addLayout(stats)
         self.b_cap, self.b_proc, self.b_ms = uv.Badge("Capture —", "info"), uv.Badge("Process —", "accent"), uv.Badge("— ms", "accent")
@@ -547,8 +644,7 @@ class Window(uv.Surface):
         stats.addStretch(1)
 
         side = uv.Card(padding=16); side.setFixedWidth(470); body.addWidget(side)
-        self.nav = uv.NavBar(["Detect", "FOV", "Draw", "Screen", "NNMM", "Look"])
-        side.layout().addWidget(self.nav)
+        self.nav = uv.NavBar(TABS); side.layout().addWidget(self.nav)
         self.pages = QStackedWidget(); side.layout().addWidget(self.pages, 1)
         self.build_pages()
         self.nav.currentChanged.connect(self.pages.setCurrentIndex)
@@ -556,16 +652,22 @@ class Window(uv.Surface):
         QShortcut(QKeySequence("F8"), self, self.toggle)
         QShortcut(QKeySequence("F9"), self, lambda: self.ov_switch.setChecked(not self.ov_switch.isChecked()))
         QShortcut(QKeySequence("F10"), self, lambda: self.view_tabs.setCurrentIndex((self.view_tabs.currentIndex() + 1) % 3))
-        QShortcut(QKeySequence("Escape"), self, lambda: self.preview.sampling and self.toggle_sample())
+        QShortcut(QKeySequence("Escape"), self, self.cancel_modes)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Undo), self, self.undo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self.redo); QShortcut(QKeySequence("Ctrl+Y"), self, self.redo)
         uv.style().changed.connect(self.refresh_labels)
+        self.commit_undo(); self.update_pause()
+
+    def go_tab(self, i):
+        self.nav.current = i; self.nav.update(); self.pages.setCurrentIndex(i)
 
     def build_pages(self):
-        """(Re)build every settings page from cfg — used at start and after loading a profile."""
+        """(Re)build every settings page from cfg — at start, after loading a profile, undo/redo and resets."""
         cur = self.pages.currentIndex()
         while self.pages.count():
             w = self.pages.widget(0); self.pages.removeWidget(w); w.deleteLater()
         self.reg = {}
-        for page in (self.page_detect(), self.page_fov(), self.page_highlight(), self.page_screen(), self.page_nnmm(), self.page_style()):
+        for page in (self.page_detect(), self.page_fov(), self.page_highlight(), self.page_tools(), self.page_setup(), self.page_nnmm()):
             sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QScrollArea.NoFrame)
             sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             sc.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }"
@@ -576,21 +678,21 @@ class Window(uv.Surface):
             sc.setWidget(page); self.pages.addWidget(sc)
         if cur >= 0: self.pages.setCurrentIndex(cur)
 
-    # pages
+    # ── pages ────────────────────────────────────────────────────────────────
     def page_detect(self):
         p = Panel(self.cfg, self.changed, self.reg)
         p.section("Profile")
-        row = QHBoxLayout()
-        self.prof = QComboBox(); self.prof.addItems(["(unsaved)"] + profile_names())
-        if self.cfg["profile"] in profile_names(): self.prof.setCurrentText(self.cfg["profile"])
+        self.prof = QComboBox(); self.refresh_profiles()
         self.prof.activated.connect(lambda _i: self.load_profile(self.prof.currentText()))
         p.lay.addWidget(self.prof)
+        row = QHBoxLayout()
         for text, fn in (("Save", self.save_profile), ("Save as…", lambda: self.save_profile(ask=True)), ("Delete", self.delete_profile)):
             b = uv.Button(text, size="sm"); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(1); p.lay.addLayout(row)
 
         p.section("Colours to find")
-        self.color_box = QVBoxLayout(); self.color_box.setSpacing(2); p.lay.addLayout(self.color_box)
+        self.color_list = QWidget(); self.color_box = QVBoxLayout(self.color_list)
+        self.color_box.setContentsMargins(0, 0, 0, 0); self.color_box.setSpacing(2); p.lay.addWidget(self.color_list)
         add = uv.Button("+ Add colour", size="sm"); add.clicked.connect(self.add_color); self.add_btn = add
         p.lay.addWidget(add, 0, Qt.AlignLeft)
         self.render_colors()
@@ -615,7 +717,7 @@ class Window(uv.Surface):
         p.slider("Merge distance", "merge", 0, 30, "{} px", "Joins nearby pieces (outlines) into one box.")
         p.slider("Max boxes", "max_targets", 1, 64, "{}")
         p.choice("Order", "sort", [("Largest first", "largest"), ("Closest to centre", "closest")])
-        p.end(); return p
+        p.end(lambda: self.reset_tab("Detect")); return p
 
     def page_fov(self):
         p = Panel(self.cfg, self.changed, self.reg)
@@ -630,16 +732,16 @@ class Window(uv.Surface):
         p.switch("Show FOV ring", "show_fov")
         p.switch("Centre crosshair", "crosshair")
         p.section("Saved regions")
-        row = QHBoxLayout()
         self.region_box = QComboBox(); self.fill_regions()
         self.region_box.activated.connect(lambda _i: self.load_region(self.region_box.currentText()))
         p.lay.addWidget(self.region_box)
+        row = QHBoxLayout()
         for text, fn in (("Save region…", self.save_region), ("Delete", self.delete_region)):
             b = uv.Button(text, size="sm"); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(1); p.lay.addLayout(row)
         p.section("Performance")
         p.slider("Max FPS", "max_fps", 5, 240, "{}", "Caps how often frames are processed.")
-        p.end(); return p
+        p.end(lambda: self.reset_tab("FOV")); return p
 
     def page_highlight(self):
         p = Panel(self.cfg, self.changed, self.reg)
@@ -649,7 +751,7 @@ class Window(uv.Surface):
         p.slider("Glow radius", "glow", 0, 30, "{} px")
         p.slider("Line thickness", "thickness", 1, 6, "{} px")
         p.section("Colour-blind assist")
-        p.switch("Recolour the detected colours", "assist")
+        self.assist_sw = p.switch("Recolour the detected colours", "assist")
         p.choice("Style", "assist_style", [("Stripes", "stripes"), ("Solid", "solid"), ("Outline", "outline")])
         p.lay.addWidget(label("Show as", 13))
         p.swatches([("Blue", "#2a6bff"), ("Yellow", "#ffe100"), ("White", "#ffffff"), ("Magenta", "#ff2ad4"), ("Cyan", "#00e5ff"), ("Black", "#111111")],
@@ -659,9 +761,52 @@ class Window(uv.Surface):
         p.section("Preview")
         p.switch("Name labels on boxes", "labels")
         p.switch("FPS / timing HUD", "hud")
+        p.end(lambda: self.reset_tab("Draw")); return p
+
+    def page_tools(self):
+        p = Panel(self.cfg, self.changed, self.reg)
+        p.section("Eyedropper")
+        row = QHBoxLayout()
+        self.eye_btn = uv.Button("Eyedropper", size="sm"); self.eye_btn.clicked.connect(lambda: self.start_eyedrop("info"))
+        self.eye_btn.setToolTip("Hover the preview for a magnified view; click to copy the colour"); row.addWidget(self.eye_btn)
+        self.copy_btn = uv.Button("Copy HEX", size="sm"); self.copy_btn.clicked.connect(lambda: self.copy(tools.info(self.eye_rgb)["hex"]))
+        self.target_btn = uv.Button("Add as target", size="sm"); self.target_btn.clicked.connect(self.eye_to_target)
+        row.addWidget(self.copy_btn); row.addWidget(self.target_btn); row.addStretch(1); p.lay.addLayout(row)
+        info = QHBoxLayout(); info.setSpacing(12)
+        self.eye_sw = Swatch("Picked colour", "#808080", 46); info.addWidget(self.eye_sw, 0, Qt.AlignTop)
+        self.eye_info = label("Start the eyedropper, then click a pixel in the preview.", 12, mono=True); self.eye_info.setWordWrap(True)
+        info.addWidget(self.eye_info, 1); p.lay.addLayout(info)
+        self.copied = label("", 11, muted=True); p.lay.addWidget(self.copied)
+        p.lay.addWidget(label("History", 13))
+        self.hist_row = QHBoxLayout(); self.hist_row.setSpacing(2); p.lay.addLayout(self.hist_row)
+        self.render_history(); self.show_eye()
+
+        p.section("Contrast checker")
+        cr = QHBoxLayout(); cr.setSpacing(6)
+        self.ca_sw, self.cb_sw = Swatch("Text", self.cfg["contrast_a"], 34), Swatch("Background", self.cfg["contrast_b"], 34)
+        self.ca_sw.clicked.connect(lambda _c: self.start_eyedrop("A")); self.cb_sw.clicked.connect(lambda _c: self.start_eyedrop("B"))
+        cr.addWidget(self.ca_sw); cr.addWidget(label("Text", 12)); cr.addSpacing(8); cr.addWidget(self.cb_sw); cr.addWidget(label("Background", 12)); cr.addStretch(1)
+        p.lay.addLayout(cr)
+        row = QHBoxLayout()
+        for text, fn in (("Pick text", lambda: self.start_eyedrop("A")), ("Pick background", lambda: self.start_eyedrop("B")), ("Swap", self.swap_contrast)):
+            b = uv.Button(text, size="sm"); b.clicked.connect(fn); row.addWidget(b)
+        row.addStretch(1); p.lay.addLayout(row)
+        self.ratio = uv.Heading("", 30); p.lay.addWidget(self.ratio)
+        badges = QHBoxLayout(); badges.setSpacing(4); self.wcag = {}
+        for k in ("AA", "AA large", "AAA", "AAA large"):
+            b = uv.Badge(k, "success"); self.wcag[k] = b; badges.addWidget(b)
+        badges.addStretch(1); p.lay.addLayout(badges)
+        self.csample = ContrastSample(); p.lay.addWidget(self.csample)
+        p.lay.addWidget(label("WCAG 2: AA needs 4.5:1 for normal text and 3:1 for large text; AAA needs 7:1 and 4.5:1.", 11, muted=True))
+        self.show_contrast()
+
+        p.section("Palette from the FOV")
+        b = uv.Button("Extract colours", size="sm"); b.clicked.connect(self.extract_palette); p.lay.addWidget(b, 0, Qt.AlignLeft)
+        self.pal_box = QVBoxLayout(); self.pal_box.setSpacing(2); p.lay.addLayout(self.pal_box)
+        p.lay.addWidget(label("Finds the 8 main colours in the FOV right now. Add any of them as a colour to find.", 11, muted=True))
         p.end(); return p
 
-    def page_screen(self):
+    def page_setup(self):
         p = Panel(self.cfg, self.changed, self.reg)
         p.section("Overlay on your screen")
         p.lay.addWidget(label("Draws the FOV and highlights on top of everything, click-through. Toggle with the switch at the top or F9.", 11, muted=True))
@@ -672,23 +817,36 @@ class Window(uv.Surface):
         self.screen_box.setCurrentIndex(min(self.cfg["overlay_screen"], self.screen_box.count() - 1))
         self.screen_box.currentIndexChanged.connect(lambda i: self.changed("overlay_screen", i))
         row.addWidget(self.screen_box); p.lay.addLayout(row)
+
         p.section("Capture")
         p.choice("Source", "source", [("Monitor", MONITOR), ("Window", WINDOW)])
         p.lay.addWidget(label("Window capture doesn't line up with the overlay (Wayland hides window positions); use Monitor for that.", 11, muted=True))
         p.switch("Include mouse cursor", "cursor")
         p.switch("Minimize ChromaScope while capturing", "minimize")
         b = uv.Button("Choose a different screen", size="sm"); b.clicked.connect(self.forget_screen); p.lay.addWidget(b, 0, Qt.AlignLeft)
-        p.lay.addWidget(label("Changes here apply the next time capture starts.", 11, muted=True))
-        p.end(); return p
 
-    def page_nnmm(self):
-        p = Panel(self.cfg, self.changed, self.reg)
-        p.section("NNMM")
-        p.lay.addWidget(uv.Alert("Placeholder: nothing here yet.", "info"))
-        p.end(); return p
+        p.section("Auto-pause")
+        p.switch("Pause while the screen is locked", "pause_locked")
+        p.switch("Pause when the screen stops changing", "pause_static")
+        p.slider("…after", "pause_static_s", 5, 300, "{} s")
+        self.focus_sw = p.switch("Only run while a chosen app is focused", "pause_focus")
+        self.focus_edit = uv.LineEdit(self.cfg["focus_match"], "App or window title, e.g. firefox")
+        self.focus_edit.textChanged.connect(lambda t: self.changed("focus_match", t)); p.lay.addWidget(self.focus_edit)
+        self.focus_seen = QComboBox(); self.focus_seen.addItem("(recently focused apps)"); self.focus_seen.addItems(self.focus.seen)
+        self.focus_seen.activated.connect(lambda i: i and self.focus_edit.setText(self.focus_seen.currentText()))
+        p.lay.addWidget(self.focus_seen)
+        p.lay.addWidget(label("Paused capture skips all processing, so it costs almost no CPU. The focused app is reported by a tiny KWin script.", 11, muted=True))
 
-    def page_style(self):
-        p = Panel(self.cfg, self.changed, self.reg)
+        p.section("Share profiles")
+        g = QGridLayout(); g.setSpacing(4)
+        for i, (text, fn) in enumerate((("Export file…", self.export_profile), ("Import file…", self.import_profile_file),
+                                        ("Copy share code", self.copy_code), ("Paste share code", self.paste_code),
+                                        ("Add example profiles", self.add_examples))):
+            b = uv.Button(text, size="sm"); b.clicked.connect(fn); g.addWidget(b, i // 2, i % 2)
+        p.lay.addLayout(g)
+        self.share_msg = label(getattr(self, "share_note", "Share codes are short text (CSP1:…) you can paste in a chat."), 11, muted=True)
+        p.lay.addWidget(self.share_msg)
+
         p.section("Look (UI Vault kits)")
         grid = QGridLayout(); grid.setSpacing(4)
         for i, k in enumerate(uv.kits()):
@@ -701,16 +859,24 @@ class Window(uv.Surface):
         if self.cfg["theme"] in uv.themes(): th.setCurrentText(self.cfg["theme"])
         th.currentTextChanged.connect(lambda t: (self.cfg.update(theme=None if t.startswith("(") else t), self.restyle_app(), save_settings(self.cfg)))
         row.addWidget(th); p.lay.addLayout(row)
-        p.lay.addWidget(uv.Alert("Every control here is painted by UiVault3 from the UI Vault website's designs.", "info"))
+
+        p.section("Help")
+        b = uv.Button("Take the tour again", size="sm"); b.clicked.connect(self.start_tour); p.lay.addWidget(b, 0, Qt.AlignLeft)
+        p.end(lambda: self.reset_tab("Setup")); return p
+
+    def page_nnmm(self):
+        p = Panel(self.cfg, self.changed, self.reg)
+        p.section("NNMM")
+        p.lay.addWidget(uv.Alert("Placeholder: nothing here yet.", "info"))
         p.end(); return p
 
-    # colours
+    # ── colours ──────────────────────────────────────────────────────────────
     def sel(self): return self.cfg["colors"][self.cfg["sel"]]
 
     def render_colors(self):
         while self.color_box.count():
             w = self.color_box.takeAt(0).widget()
-            if w: w.deleteLater()
+            if w: w.hide(); w.deleteLater()
         many = len(self.cfg["colors"]) > 1
         for i, c in enumerate(self.cfg["colors"]):
             r = ColorRow(c, i == self.cfg["sel"], many)
@@ -727,13 +893,16 @@ class Window(uv.Surface):
         QTimer.singleShot(0, lambda: (self.apply_values(tolerance=s["tolerance"], min_sat=s["min_sat"], min_val=s["min_val"]),
                                       self.render_colors(), self.show_color()))
 
-    def add_color(self):
-        used = {c["color"].lower() for c in self.cfg["colors"]}
-        name, col = next(((n, c) for n, c in PRESETS if c.lower() not in used), PRESETS[0])
-        box = BOX_COLORS[len(self.cfg["colors"]) % len(BOX_COLORS)][1]
-        self.cfg["colors"].append(new_color(name, col, box))
+    def add_color(self, entry=None):
+        if len(self.cfg["colors"]) >= MAX_COLORS: return False
+        if entry is None:
+            used = {c["color"].lower() for c in self.cfg["colors"]}
+            name, col = next(((n, c) for n, c in PRESETS if c.lower() not in used), PRESETS[0])
+            entry = new_color(name, col, BOX_COLORS[len(self.cfg["colors"]) % len(BOX_COLORS)][1])
+        self.cfg["colors"].append(entry)
         self.cfg["sel"] = len(self.cfg["colors"]) - 2       # select_color() needs a change to act
         self.select_color(len(self.cfg["colors"]) - 1); self.changed("colors")
+        return True
 
     def remove_color(self, i):
         if len(self.cfg["colors"]) <= 1: return
@@ -765,7 +934,13 @@ class Window(uv.Surface):
         c = QColorDialog.getColor(QColor(self.sel()["color"]), self, "Target colour")
         if c.isValid(): self.set_color(c.name(), "Custom")
 
+    # ── preview modes: sample (drag) and eyedropper (click) ──────────────────
+    def cancel_modes(self):
+        if self.preview.sampling: self.toggle_sample()
+        if self.preview.eyedrop: self.stop_eyedrop()
+
     def toggle_sample(self):
+        if self.preview.eyedrop: self.stop_eyedrop()
         self.preview.sampling = not self.preview.sampling; self.preview.drag = None
         if self.preview.sampling and self.cfg["view"] == "mask": self.view_tabs.setCurrentIndex(0)
         self.sample_btn.setText("Drag over the preview…" if self.preview.sampling else "Sample from preview"); self.sample_btn.updateGeometry()
@@ -781,7 +956,108 @@ class Window(uv.Surface):
                 self.show_color(); self.render_colors()
         if self.preview.sampling: self.toggle_sample()
 
-    # profiles + regions
+    def pixel_at(self, x, y):
+        f = self.engine.last_frame if self.engine else None
+        if f is None: return None
+        H, W = f.shape[:2]
+        x, y = max(5, min(W - 6, x)), max(5, min(H - 6, y))
+        crop = np.ascontiguousarray(f[y - 5:y + 6, x - 5:x + 6, 2::-1])        # BGRx → RGB
+        return tuple(int(v) for v in crop[5, 5]), crop
+
+    def start_eyedrop(self, purpose):
+        if self.preview.sampling: self.toggle_sample()
+        if self.preview.eyedrop and self.pick_for == purpose: return self.stop_eyedrop()
+        if not self.running:
+            self.eye_info.setText("Start capture first, then click a pixel in the preview."); self.go_tab(TABS.index("Tools")); return
+        if self.cfg["view"] == "mask": self.view_tabs.setCurrentIndex(0)
+        self.pick_for, self.preview.eyedrop = purpose, True
+        self.eye_btn.setText("Picking… (Esc)" if purpose == "info" else "Eyedropper"); self.eye_btn.updateGeometry()
+        self.preview.update()
+
+    def stop_eyedrop(self):
+        self.preview.eyedrop, self.preview.hover, self.pick_for = False, None, None
+        self.eye_btn.setText("Eyedropper"); self.eye_btn.updateGeometry(); self.preview.unsetCursor(); self.preview.update()
+
+    def eye_picked(self, x, y):
+        got = self.pixel_at(x, y)
+        if not got: return
+        hexc = tools.info(got[0])["hex"]
+        if self.pick_for in ("A", "B"):
+            self.cfg["contrast_a" if self.pick_for == "A" else "contrast_b"] = hexc; save_settings(self.cfg)
+            self.show_contrast(); self.stop_eyedrop(); return
+        self.eye_rgb = got[0]; self.copy(hexc)
+        self.cfg["history"] = ([hexc] + [h for h in self.cfg["history"] if h != hexc])[:14]; save_settings(self.cfg)
+        self.render_history(); self.show_eye()
+
+    def show_eye(self):
+        on = self.eye_rgb is not None
+        self.copy_btn.setEnabled(on); self.target_btn.setEnabled(on)
+        if not on: return
+        i = tools.info(self.eye_rgb)
+        self.eye_sw.color = i["hex"]; self.eye_sw.update()
+        self.eye_info.setText(f"{i['hex']}   ({i['name']})\n{i['rgb']}\n{i['hsv']}")
+
+    def render_history(self):
+        while self.hist_row.count():
+            w = self.hist_row.takeAt(0).widget()
+            if w: w.hide(); w.deleteLater()
+        for h in self.cfg["history"]:
+            s = Swatch(h, h, 26); s.clicked.connect(lambda c: (setattr(self, "eye_rgb", QColor(c).getRgb()[:3]), self.show_eye(), self.copy(c.upper())))
+            self.hist_row.addWidget(s)
+        if not self.cfg["history"]:
+            l = label("Colours you pick appear here.", 11, muted=True); l.setWordWrap(False); self.hist_row.addWidget(l)
+        self.hist_row.addStretch(1)
+
+    def eye_to_target(self):
+        if self.eye_rgb is None: return
+        i = tools.info(self.eye_rgb); h, s, v = hsv_of(self.eye_rgb)
+        entry = new_color(i["name"].title(), i["hex"].lower(), BOX_COLORS[len(self.cfg["colors"]) % len(BOX_COLORS)][1],
+                          10, max(30, s - 50), max(30, v - 50))
+        if self.add_color(entry): self.eye_info.setText(self.eye_info.text().split("\n\n")[0] + "\n\nAdded to the Detect tab.")
+
+    def copy(self, text):
+        QApplication.clipboard().setText(text)
+        self.preview.setToolTip(""); self.copied.setText(f"Copied {text} to the clipboard")
+        QTimer.singleShot(2500, lambda: self.copied.setText(""))
+
+    def swap_contrast(self):
+        self.cfg["contrast_a"], self.cfg["contrast_b"] = self.cfg["contrast_b"], self.cfg["contrast_a"]
+        save_settings(self.cfg); self.show_contrast()
+
+    def show_contrast(self):
+        a, b = self.cfg["contrast_a"], self.cfg["contrast_b"]
+        r, ok = tools.contrast(QColor(a).getRgb()[:3], QColor(b).getRgb()[:3])
+        self.ca_sw.color, self.cb_sw.color = a, b; self.ca_sw.update(); self.cb_sw.update()
+        self.ratio.text = f"{r:.2f} : 1"; self.ratio.updateGeometry(); self.ratio.update()
+        for k, badge in self.wcag.items():
+            badge.text, badge.kind = f"{k} {'✓' if ok[k] else '✗'}", "success" if ok[k] else "danger"
+            badge._restyle() if hasattr(badge, "_restyle") else None; badge.updateGeometry(); badge.update()
+        self.csample.a, self.csample.b = a, b; self.csample.update()
+
+    def extract_palette(self):
+        while self.pal_box.count():
+            w = self.pal_box.takeAt(0).widget()
+            if w: w.hide(); w.deleteLater()
+        f = self.engine.last_frame if self.engine else None
+        if f is None: self.pal_box.addWidget(label("Start capture first.", 12, muted=True)); return
+        x, y, w, h = fov_rect(self.cfg, f.shape[1], f.shape[0])
+        for rgb, share, _hsv, rng in tools.palette(f[y:y + h, x:x + w]):
+            i = tools.info(rgb)
+            row = QWidget(); hl = QHBoxLayout(row); hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(8)
+            sw = Swatch(i["hex"], i["hex"], 26); sw.clicked.connect(self.copy); hl.addWidget(sw)
+            hl.addWidget(label(f"{i['hex']}  {share * 100:4.1f}%", 12, mono=True)); hl.addWidget(label(i["name"], 12, muted=True)); hl.addStretch(1)
+            b = uv.Button("+ Add", size="sm")
+            b.clicked.connect(lambda _=False, i=i, rng=rng: self.add_color(new_color(i["name"].title(), i["hex"].lower(),
+                              BOX_COLORS[len(self.cfg["colors"]) % len(BOX_COLORS)][1], **rng)))
+            hl.addWidget(b); self.pal_box.addWidget(row)
+
+    # ── profiles, sharing, regions ───────────────────────────────────────────
+    def profile_data(self): return {k: self.cfg[k] for k in PROFILE_KEYS}
+
+    def refresh_profiles(self):
+        self.prof.clear(); self.prof.addItems(["(unsaved)"] + profile_names())
+        if self.cfg["profile"] in profile_names(): self.prof.setCurrentText(self.cfg["profile"])
+
     def save_profile(self, ask=False):
         name = self.cfg["profile"]
         if ask or not name:
@@ -789,22 +1065,76 @@ class Window(uv.Surface):
             if not ok or not name.strip(): return
             name = name.strip()
         path = profile_path(name)
-        path.write_text(json.dumps({k: self.cfg[k] for k in PROFILE_KEYS}, indent=1))
-        self.cfg["profile"] = path.stem; save_settings(self.cfg)
-        self.prof.clear(); self.prof.addItems(["(unsaved)"] + profile_names()); self.prof.setCurrentText(path.stem)
+        path.write_text(json.dumps(self.profile_data(), indent=1))
+        self.cfg["profile"] = path.stem; save_settings(self.cfg); self.refresh_profiles()
 
     def load_profile(self, name):
         try: data = json.loads(profile_path(name).read_text())
         except Exception: return
         self.cfg.update({k: v for k, v in data.items() if k in PROFILE_KEYS}); self.cfg["profile"] = name
         fix_colors(self.cfg); save_settings(self.cfg)
-        QTimer.singleShot(0, self.build_pages)
+        QTimer.singleShot(0, lambda: (self.build_pages(), self.commit_undo()))
 
     def delete_profile(self):
         name = self.prof.currentText()
         if name.startswith("("): return
-        profile_path(name).unlink(missing_ok=True); self.cfg["profile"] = ""; save_settings(self.cfg)
-        self.prof.clear(); self.prof.addItems(["(unsaved)"] + profile_names())
+        profile_path(name).unlink(missing_ok=True); self.cfg["profile"] = ""; save_settings(self.cfg); self.refresh_profiles()
+
+    def import_profile(self, data, name):
+        data = {k: v for k, v in data.items() if k in PROFILE_KEYS}
+        if not data.get("colors"): raise ValueError("That profile has no colours in it")
+        base, n = (name or "Imported").strip()[:40], 2
+        name = base
+        while profile_path(name).exists(): name = f"{base} {n}"; n += 1
+        profile_path(name).write_text(json.dumps(data, indent=1))
+        self.load_profile(profile_path(name).stem)
+        return profile_path(name).stem
+
+    def note(self, text):
+        """Message under Share profiles; kept across page rebuilds (importing a profile rebuilds the pages)."""
+        self.share_note = text; self.share_msg.setText(text)
+
+    def export_profile(self):
+        name = self.cfg["profile"] or "ChromaScope profile"
+        path, _ = QFileDialog.getSaveFileName(self, "Export profile", str(Path.home() / f"{name}.chromascope.json"), "ChromaScope profile (*.json)")
+        if not path: return
+        Path(path).write_text(json.dumps({"name": name, **self.profile_data()}, indent=1))
+        self.note(f"Exported to {path}")
+
+    def import_profile_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import profile", str(Path.home()), "ChromaScope profile (*.json)")
+        if not path: return
+        try:
+            data = json.loads(Path(path).read_text())
+            got = self.import_profile(data, data.get("name") or Path(path).name.split(".")[0])
+            self.note(f"Imported and loaded “{got}”.")
+        except Exception as e:
+            self.note(f"Couldn't import: {e}")
+
+    def copy_code(self):
+        QApplication.clipboard().setText(tools.to_code({"name": self.cfg["profile"] or "Shared profile", **self.profile_data()}))
+        self.note("Share code copied to the clipboard.")
+
+    def paste_code(self):
+        text = QApplication.clipboard().text().strip()
+        if not text.startswith(tools.CODE_PREFIX):
+            text, ok = QInputDialog.getMultiLineText(self, "Paste share code", "Share code (starts with CSP1:):")
+            if not ok: return
+        try:
+            data = tools.from_code(text)
+            got = self.import_profile(data, data.get("name"))
+            self.note(f"Imported and loaded “{got}”.")
+        except Exception as e:
+            self.note(f"Couldn't read that code: {e}")
+
+    def add_examples(self):
+        added = []
+        for n, data in EXAMPLES.items():
+            if profile_path(n).exists(): continue
+            profile_path(n).write_text(json.dumps(data, indent=1)); added.append(n)
+        self.refresh_profiles()
+        self.note(f"Added {len(added)} example profile{'s' if len(added) != 1 else ''} — pick one in the Profile list on the Detect tab."
+                               if added else "The example profiles are already there.")
 
     def fill_regions(self):
         self.region_box.clear(); self.region_box.addItems(["(choose a region)"] + sorted(self.cfg["regions"]))
@@ -813,15 +1143,39 @@ class Window(uv.Surface):
         name, ok = QInputDialog.getText(self, "Save region", "Region name:", text="Region")
         if not ok or not name.strip(): return
         self.cfg["regions"][name.strip()] = {k: self.cfg[k] for k in ("fov", "fov_shape", "fov_dx", "fov_dy")}
-        save_settings(self.cfg); self.fill_regions(); self.region_box.setCurrentText(name.strip())
+        self.changed("regions"); self.fill_regions(); self.region_box.setCurrentText(name.strip())
 
     def load_region(self, name):
         if name in self.cfg["regions"]: self.apply_values(**self.cfg["regions"][name])
 
     def delete_region(self):
-        self.cfg["regions"].pop(self.region_box.currentText(), None); save_settings(self.cfg); self.fill_regions()
+        self.cfg["regions"].pop(self.region_box.currentText(), None); self.changed("regions"); self.fill_regions()
 
-    # behaviour
+    # ── undo / reset ─────────────────────────────────────────────────────────
+    def commit_undo(self):
+        self.history.commit(json.loads(json.dumps({k: self.cfg[k] for k in UNDO_KEYS})))
+        self.undo_btn.setEnabled(self.history.can_undo()); self.redo_btn.setEnabled(self.history.can_redo())
+
+    def restore(self, snap):
+        if snap is None: return
+        self.restoring = True
+        self.cfg.update(snap); fix_colors(self.cfg); save_settings(self.cfg); self.build_pages()
+        self.restoring = False
+        self.undo_btn.setEnabled(self.history.can_undo()); self.redo_btn.setEnabled(self.history.can_redo())
+        self.preview.update(); self.overlay.update()
+
+    def undo(self):
+        if self.undo_timer.isActive(): self.undo_timer.stop(); self.commit_undo()   # keep the change in flight
+        self.restore(self.history.undo())
+
+    def redo(self): self.restore(self.history.redo())
+
+    def reset_tab(self, tab):
+        for k in RESET_KEYS[tab]: self.cfg[k] = json.loads(json.dumps(DEFAULTS[k]))
+        fix_colors(self.cfg); save_settings(self.cfg)
+        QTimer.singleShot(0, lambda: (self.build_pages(), self.commit_undo(), self.update_pause(), self.preview.update()))
+
+    # ── behaviour ────────────────────────────────────────────────────────────
     def apply_values(self, **kv):
         """Set cfg values and move their controls to match."""
         self.cfg.update(kv)
@@ -850,7 +1204,29 @@ class Window(uv.Surface):
             self.sel()[key] = self.cfg[key]
             if key == "tolerance": self.render_colors()
         if key == "overlay_screen" and self.overlay.isVisible(): self.overlay.show_on(self.cfg["overlay_screen"])
+        if key.startswith("pause_") or key == "focus_match": self.update_pause()
         save_settings(self.cfg); self.preview.update(); self.overlay.update()
+        if not self.restoring and key in UNDO_KEYS + ["tolerance", "min_sat", "min_val", "fov"]: self.undo_timer.start()
+
+    def update_pause(self):
+        """Work out whether capture should be paused for lock / focus; the engine adds 'screen hasn't changed'."""
+        if self.cfg["pause_focus"]: self.focus.start()
+        else: self.focus.stop()
+        if hasattr(self, "focus_seen") and self.focus_seen.count() - 1 != len(self.focus.seen):
+            self.focus_seen.clear(); self.focus_seen.addItem("(recently focused apps)"); self.focus_seen.addItems(self.focus.seen)
+        reason = ""
+        if self.cfg["pause_locked"] and self.lock.locked: reason = "screen locked"
+        elif self.cfg["pause_focus"] and self.cfg["focus_match"].strip() and self.focus.app and not self.focus.matches(self.cfg["focus_match"]):
+            reason = f"“{self.cfg['focus_match'].strip()}” isn't focused"
+        self.cfg["_pause"] = reason
+
+    def on_paused(self, reason):
+        self.preview.paused = reason; self.preview.update()
+        if reason:
+            self.set_status("Paused", "warn"); self.status.setToolTip(reason)
+            self.overlay.data = None; self.overlay.update()
+        else:
+            self.set_status("Live", "success"); self.status.setToolTip("")
 
     def forget_screen(self):
         self.cfg["restore_token"] = None; save_settings(self.cfg)
@@ -865,11 +1241,12 @@ class Window(uv.Surface):
         if self.running:
             self.engine.stop_capture(); self.engine = None; self.running = False
             self.go.setText("Start capture"); self.set_status("Idle", "warn")
-            self.preview.data = None; self.preview.update(); self.overlay.data = None; self.overlay.update()
+            self.preview.data = None; self.preview.paused = ""; self.preview.update(); self.overlay.data = None; self.overlay.update()
+            if self.preview.eyedrop: self.stop_eyedrop()
         else:
             self.engine = Engine(self.cfg)
             self.engine.frameReady.connect(self.on_frame); self.engine.failed.connect(self.on_fail)
-            self.engine.started_ok.connect(lambda: self.set_status("Live", "success"))
+            self.engine.started_ok.connect(lambda: self.set_status("Live", "success")); self.engine.pausedChanged.connect(self.on_paused)
             self.engine.start_capture(); self.running = True
             self.go.setText("Stop capture"); self.set_status("Waiting for screen…", "info")
             if self.cfg["minimize"]: QTimer.singleShot(400, self.showMinimized)
@@ -880,6 +1257,11 @@ class Window(uv.Surface):
         self.status.text, self.status.kind = text, kind
         self.status._restyle() if hasattr(self.status, "_restyle") else None
         self.status.updateGeometry(); self.status.update()
+
+    def restore_status(self):
+        if not self.running: self.set_status("Idle", "warn")
+        elif self.preview.paused: self.set_status("Paused", "warn")
+        else: self.set_status("Live", "success")
 
     def on_fail(self, msg):
         if self.running: self.toggle()
@@ -897,9 +1279,39 @@ class Window(uv.Surface):
                      (self.b_ms, f"{d['ms']:.1f} ms"), (self.b_hits, f"{len(d['targets'])} hits"), (self.b_res, f"{w}×{h}")):
             if b.text != t: b.text = t; b.updateGeometry(); b.update()
 
+    # ── tour ─────────────────────────────────────────────────────────────────
+    def start_tour(self):
+        T = TABS.index
+        steps = [
+            (None, "Welcome to ChromaScope", "It finds colours on your screen and highlights them, live. This quick tour shows where everything is.", None),
+            (lambda: self.go, "Start here", "Start capture (or F8). The first time, KDE asks which screen to share; it remembers after that.", None),
+            (lambda: self.preview, "Live preview", "Your screen with every match boxed. Drag the dashed FOV ring to move it, drag its edge to resize. "
+                                                   "Screen / FOV zoom / Mask above switch what you see.", None),
+            (lambda: self.color_list, "Colours to find", "Up to 6 colours, each with its own box colour. Click one to edit it, double-click to rename.",
+             lambda: self.go_tab(T("Detect"))),
+            (lambda: self.sample_btn, "Teach it a colour", "Sample from preview, then drag over something on screen. The colour range is worked out for you.",
+             lambda: self.go_tab(T("Detect"))),
+            (lambda: self.assist_sw, "Highlights and assist", "The Draw tab picks Box, Glow or Corners, and the colour-blind assist that recolours a hue you find hard to see.",
+             lambda: self.go_tab(T("Draw"))),
+            (lambda: self.ov_switch, "On your real screen", "Draws the highlights over every app, click-through. It's hidden from the capture, so it never detects itself.", None),
+            (lambda: self.eye_btn, "Colour tools", "Eyedropper with a magnifier, a WCAG contrast checker and a palette extractor.",
+             lambda: self.go_tab(T("Tools"))),
+            (lambda: self.undo_box, "Undo anything", "Every settings change can be undone (Ctrl+Z) and redone (Ctrl+Shift+Z). Each tab also has Reset this tab.", None),
+            (lambda: self.focus_sw, "Setup", "Auto-pause, sharing profiles as files or codes, example profiles and the app's look all live on the Setup tab. "
+                                             "You can replay this tour from there.", lambda: self.go_tab(T("Setup"))),
+        ]
+        self.tour = Tour(self, steps)
+        self.tour.finished.connect(lambda: (self.cfg.update(toured=True), save_settings(self.cfg), self.go_tab(T("Detect"))))
+        self.tour.start()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        t = getattr(self, "tour", None)
+        if t is not None and t.isVisible(): t.place()
+
     def closeEvent(self, e):
         if self.engine: self.engine.stop_capture()
-        self.overlay.close(); super().closeEvent(e)
+        self.focus.stop(); self.overlay.close(); super().closeEvent(e)
 
 
 def main():
@@ -907,6 +1319,7 @@ def main():
     app.setApplicationName("ChromaScope"); app.setDesktopFileName("chromascope")
     ensure_kwin_rules()
     w = Window(app); w.show()
+    if not w.cfg["toured"]: QTimer.singleShot(600, w.start_tour)
     if "--start" in sys.argv: QTimer.singleShot(300, w.toggle)
     sys.exit(app.exec())
 
