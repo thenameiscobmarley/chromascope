@@ -1,0 +1,3 @@
+PySide6-Essentials
+numpy
+opencv-python-headless
