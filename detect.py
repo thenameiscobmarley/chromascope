@@ -1,4 +1,5 @@
-"""Colour detection: HSV threshold inside the FOV, merge nearby pixels, return boxes + preview image."""
+"""Colour detection: HSV thresholds inside the FOV for each enabled colour, merge nearby pixels, return boxes.
+Also: sampling a colour range from a dragged area, the red glow tint, and the colour-blind assist layer."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ class Target:
     x: int; y: int; w: int; h: int          # full-frame pixels
     area: int
     dist: float                              # distance of the box centre from the FOV centre
+    cls: int = 0                             # index into cfg["colors"]
 
 
 def hsv_of(rgb):
@@ -21,47 +23,91 @@ def hsv_of(rgb):
 
 
 def fov_rect(cfg, w, h):
+    """(x, y, width, height) of the scanned area in frame pixels."""
+    if cfg["fov_shape"] == "full": return 0, 0, w, h
     s = min(cfg["fov"], w, h)
     cx, cy = w // 2 + cfg.get("fov_dx", 0), h // 2 + cfg.get("fov_dy", 0)
     x0, y0 = max(0, min(w - s, cx - s // 2)), max(0, min(h - s, cy - s // 2))
     return x0, y0, s, s
 
 
-def detect(frame, cfg, ignore=()):
-    """frame: (h, w, 4) BGRx. Returns (targets, mask, fov_rect). `ignore` = frame rects (x, y, w, h, band) whose
-    outline band is drawn by our own overlay and must not be detected (stops the overlay feeding back)."""
-    H, W = frame.shape[:2]
-    fx, fy, fs, _ = fov_rect(cfg, W, H)
-    roi = cv2.cvtColor(frame[fy:fy + fs, fx:fx + fs], cv2.COLOR_BGRA2BGR)   # contiguous copy: ~8x faster HSV
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    h, tol = cfg["hue"], cfg["tolerance"]
-    lo_s, lo_v = cfg["min_sat"], cfg["min_val"]
+def color_mask(hsv, c):
+    h, tol, lo_s, lo_v = c["hue"], c["tolerance"], c["min_sat"], c["min_val"]
     lo, hi = h - tol, h + tol
     mask = cv2.inRange(hsv, (max(lo, 0), lo_s, lo_v), (min(hi, 179), 255, 255))
     if lo < 0: mask |= cv2.inRange(hsv, (180 + lo, lo_s, lo_v), (179, 255, 255))
     if hi > 179: mask |= cv2.inRange(hsv, (0, lo_s, lo_v), (hi - 180, 255, 255))
-    if cfg["fov_shape"] == "circle":
-        circ = np.zeros_like(mask); cv2.circle(circ, (fs // 2, fs // 2), fs // 2, 255, -1); mask &= circ
-    for (x, y, w, hh, band) in ignore:      # our own overlay outlines
-        x, y = x - fx, y - fy
-        cv2.rectangle(mask, (x, y), (x + w, y + hh), 0, band)
+    return mask
 
-    merge = cfg["merge"]
-    grown = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (merge * 2 + 1,) * 2)) if merge > 0 else mask
-    n, _lab, stats, _ = cv2.connectedComponentsWithStats(grown, connectivity=8)
-    c = fs / 2
+
+def detect(frame, cfg, ignore=()):
+    """frame: (h, w, 4) BGRx. Returns (targets, combined mask, fov_rect); the mask may be half-size for big areas. `ignore` = frame rects (x, y, w, h, band)
+    whose outline band our own overlay drew and must not be detected (fallback if KWin can't hide the overlay)."""
+    H, W = frame.shape[:2]
+    fx, fy, fw, fh = fov_rect(cfg, W, H)
+    k = 2 if fw * fh > 500_000 else 1         # big areas (full screen): work at half resolution, ~4x faster
+    roi = frame[fy:fy + fh, fx:fx + fw]
+    if k > 1: roi = cv2.resize(roi, (fw // k, fh // k), interpolation=cv2.INTER_NEAREST)
+    hsv = cv2.cvtColor(cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR), cv2.COLOR_BGR2HSV)   # contiguous copy: ~8x faster HSV
+    fx0, fy0 = fx, fy
+    fw, fh = hsv.shape[1], hsv.shape[0]
+    keep = None
+    if cfg["fov_shape"] == "circle":
+        keep = np.zeros((fh, fw), np.uint8); cv2.circle(keep, (fw // 2, fh // 2), fw // 2, 255, -1)
+    if ignore:
+        keep = np.full((fh, fw), 255, np.uint8) if keep is None else keep
+        for (x, y, w, hh, band) in ignore:
+            cv2.rectangle(keep, ((x - fx) // k, (y - fy) // k), ((x - fx + w) // k, (y - fy + hh) // k), 0, max(1, band // k))
+
+    merge = cfg["merge"] // k
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (merge * 2 + 1,) * 2) if merge > 0 else None
+    total = np.zeros((fh, fw), np.uint8)
+    cx, cy = fw / 2, fh / 2
     out = []
-    for i in range(1, n):
-        x, y, w, hh, _ = stats[i]
-        sub = mask[y:y + hh, x:x + w]
-        real = int(cv2.countNonZero(sub))
-        if real < cfg["min_area"]: continue
-        bx, by, bw, bh = cv2.boundingRect(sub)      # shrink back to the real pixels (dilation made it fatter)
-        x0, y0 = x + bx, y + by
-        d = float(np.hypot(x0 + bw / 2 - c, y0 + bh / 2 - c))
-        out.append(Target(int(x0 + fx), int(y0 + fy), int(bw), int(bh), real, d))
+    for ci, c in enumerate(cfg["colors"]):
+        if not c.get("on", True): continue
+        mask = color_mask(hsv, c)
+        if keep is not None: mask &= keep
+        total |= mask
+        grown = cv2.dilate(mask, kernel) if kernel is not None else mask
+        n, _lab, stats, _ = cv2.connectedComponentsWithStats(grown, connectivity=8)
+        for i in range(1, n):
+            x, y, w, hh, _ = stats[i]
+            sub = mask[y:y + hh, x:x + w]
+            real = int(cv2.countNonZero(sub)) * k * k
+            if real < cfg["min_area"]: continue
+            bx, by, bw, bh = cv2.boundingRect(sub)      # shrink back to the real pixels (dilation made it fatter)
+            x0, y0 = x + bx, y + by
+            d = float(np.hypot(x0 + bw / 2 - cx, y0 + bh / 2 - cy)) * k
+            out.append(Target(int(x0 * k + fx0), int(y0 * k + fy0), int(bw * k), int(bh * k), real, d, ci))
     out.sort(key=(lambda t: t.dist) if cfg["sort"] == "closest" else (lambda t: -t.area))
-    return out[:cfg["max_targets"]], mask, (fx, fy, fs, fs)
+    return out[:cfg["max_targets"]], total, (fx0, fy0, fw * k, fh * k)
+
+
+def sample(frame, x, y, w, h):
+    """Work out a colour range from an area: the dominant hue among its colourful pixels, with tolerance,
+    saturation and brightness floors that cover ~95% of them. Returns a dict or None."""
+    H, W = frame.shape[:2]
+    x, y = max(0, min(W - 1, x)), max(0, min(H - 1, y))
+    w, h = max(1, min(W - x, w)), max(1, min(H - y, h))
+    px = np.ascontiguousarray(frame[y:y + h, x:x + w, :3]).reshape(-1, 1, 3)
+    hsv = cv2.cvtColor(px, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.int32)
+    colourful = (hsv[:, 1] >= 40) & (hsv[:, 2] >= 40)
+    if colourful.sum() < 3: colourful[:] = True
+    idx = np.nonzero(colourful)[0]
+    hh = hsv[idx]
+    hist = np.bincount(hh[:, 0], minlength=180).astype(np.float32)
+    hist = sum(np.roll(hist, k) for k in range(-3, 4))        # circular smoothing so reds near 0/179 join up
+    peak = int(np.argmax(hist))
+    dev = (hh[:, 0] - peak + 90) % 180 - 90
+    near = np.abs(dev) <= 20
+    if near.sum() == 0: return None
+    sel, d = hh[near], dev[near]
+    centre = int((peak + round(float(np.median(d)))) % 180)
+    tol = int(np.clip(np.percentile(np.abs(d - (centre - peak)), 95) + 3, 5, 40))
+    b, g, r = np.median(px.reshape(-1, 3)[idx[near]], axis=0).astype(int)
+    return {"color": "#%02x%02x%02x" % (r, g, b), "hue": centre, "tolerance": tol,
+            "min_sat": int(max(0, np.percentile(sel[:, 1], 5) - 20)), "min_val": int(max(0, np.percentile(sel[:, 2], 5) - 20))}
 
 
 def tint(img, mask, strength=0.65, glow=10):
@@ -77,3 +123,28 @@ def tint(img, mask, strength=0.65, glow=10):
         px[:] = (px * (1 - a) + red * a).astype(np.uint8)
     px[m] = (px[m] * (1 - strength) + red * strength).astype(np.uint8)
     return img
+
+
+_stripes = {}
+
+
+def assist_layer(mask, style, rgb, max_w=960):
+    """Colour-blind assist: a premultiplied BGRA image (downscaled) that recolours, stripes or outlines the
+    matching pixels. Drawn over the preview and the on-screen overlay."""
+    h, w = mask.shape
+    s = min(1.0, max_w / w)
+    m = cv2.resize(mask, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_NEAREST) if s < 1 else mask
+    h, w = m.shape
+    if style == "outline":
+        m = cv2.morphologyEx(m, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)); a = 255
+    elif style == "stripes":
+        pat = _stripes.get((h, w))
+        if pat is None:
+            yy, xx = np.indices((h, w)); pat = _stripes[(h, w)] = np.where(((xx + yy) // 3) % 2 == 0, 255, 0).astype(np.uint8)
+        m = m & pat; a = 255
+    else:
+        a = 205
+    out = np.zeros((h, w, 4), np.uint8)
+    r, g, b = rgb
+    out[m > 0] = (b * a // 255, g * a // 255, r * a // 255, a)
+    return out
