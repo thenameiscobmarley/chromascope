@@ -139,7 +139,7 @@ class Engine(QThread):
 
     def _ignore(self, targets, cfg):
         """Outline bands our overlay drew last frame, in frame px (fallback for when KWin can't hide the overlay)."""
-        if not cfg["overlay"]: return ()
+        if not cfg["overlay"]: return []
         s = max(self.overlay_scale, 1e-3)
         pad = (4 + cfg["thickness"] + (cfg["glow"] if cfg["mode"] in ("glow", "both") else 0)) / s
         band = int(2 * pad + 6)
@@ -172,7 +172,10 @@ class Engine(QThread):
             if now < next_t: time.sleep(next_t - now)
             next_t = time.monotonic() + 1.0 / max(1, cfg["max_fps"])
             t = time.perf_counter()
-            targets, mask, fov = detect(frame, cfg, self.ignore_now(history, cfg))
+            try: targets, mask, fov = detect(frame, cfg, self.ignore_now(history, cfg))
+            except Exception as e:  # noqa: BLE001 - a bug here must show up, not silently stop the capture
+                import traceback; traceback.print_exc()
+                self.failed.emit(f"Detection error: {e}"); return
             img, src = self._preview(frame, mask, fov, cfg)
             assist = None
             if cfg["assist"]:
