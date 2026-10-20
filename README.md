@@ -22,7 +22,9 @@ After that, open **ChromaScope** from the app menu or run `./run.sh`. Pass `--st
   * **Auto-pause:** while the screen is locked, after the screen stops changing for a set time, or while a chosen app isn't focused. A tiny KWin script reports the focused app.
   * **Share profiles:** export or import a file, copy or paste a short `CSP1:` share code, or add the example profiles (traffic lights, status LEDs, red for colour-blind eyes, highlighter yellow).
   * **Look:** 18 UI Vault kits and 87 themes. The default is win98 controls on the paper theme.
-* **NNMM:** empty placeholder tab.
+* **NNMM (neural-network mouse):** pick or load a `.npz` model, start capture, turn on **Enable** (F7, or **NN mouse** in the bottom bar), then **hold right click in any window**: OpenCV finds the boxes on the captured screen, the model (run by OpenCV DNN) decides how to move, and a virtual mouse moves the pointer onto the nearest box. Let go to stop. **Hold right click on** picks a regular mouse's right button, a touchpad, or either (default); mice plugged in later are picked up within 2 s. On a touchpad, press and hold in the bottom-right corner (or press with two fingers); a two-finger tap can't be held.
+  * Models are `.npz` weight files (OpenCV DNN runs them; they're turned into an ONNX network in memory). The built-in one, `models/aim.npz`, is made by `train.py`. **Load model (.npz)** takes yours: 6 inputs (target offset x/y, target speed x/y, current speed x/y, in screen heights) → hidden layers → 2 outputs (speed x/y). Weights can be saved as `W0, b0, W1, b1…` (or `W1…`, `w_0…`, `weights_0…`), PyTorch-style `fc1.weight / fc1.bias`, unnamed `np.savez(w1, b1, w2, b2…)`, or object arrays `weights` / `biases`; in × out or out × in. Optional keys `activation` (tanh, relu, sigmoid; default tanh) and `output_activation` (default linear). Models that don't steer towards targets are refused, with the reason. `.onnx` files with the same shape also work.
+  * `./setup.sh` adds a udev rule so the logged-in user can create the virtual mouse (`/dev/uinput`) and read mouse/touchpad buttons (not keyboards). On a touchpad, a press in the bottom-right corner or a two-finger press counts as right click.
 
 **Undo / redo** (↶ ↷, Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y) covers every detection, FOV and drawing change, and each tab has **Reset this tab**.
 
@@ -35,4 +37,4 @@ Keys: F8 starts or stops capture, F9 turns the overlay on or off, F10 switches t
 
 Settings are saved in `~/.config/chromascope/` (`settings.json`, `profiles/`).
 
-Files: `capture.py` (portal + stream), `detect.py` (HSV masks → boxes, sampling, glow, assist layer), `tools.py` (colour info and names, contrast, palette, share codes), `extras.py` (undo, auto-pause watchers, tour, example profiles) and `app.py` (UI, overlay).
+Files: `capture.py` (portal + stream), `detect.py` (HSV masks → boxes, sampling, glow, assist layer), `tools.py` (colour info and names, contrast, palette, share codes), `extras.py` (undo, auto-pause watchers, tour, example profiles), `nnmm.py` (live mouse controller), `nnio.py` (.npz model loading → ONNX → OpenCV DNN), `vmouse.py` (uinput virtual mouse), `inputwatch.py` (right-click hold), `train.py` (builds models/aim.npz) and `app.py` (UI, overlay).

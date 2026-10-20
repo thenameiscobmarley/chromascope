@@ -85,6 +85,40 @@ class FocusWatcher(QObject):
         return not t or t in self.app.lower() or t in self.title.lower()
 
 
+CURSOR_SCRIPT = """function report() { var p = workspace.cursorPos;
+    callDBus("io.github.chromascope", "/Cursor", "io.github.chromascope.Cursor", "pos", p.x, p.y); }
+workspace.cursorPosChanged.connect(report);
+report();
+"""
+
+
+@ClassInfo({"D-Bus Interface": "io.github.chromascope.Cursor"})
+class CursorWatcher(QObject):
+    """The pointer's position in desktop (logical) px, reported by a KWin script on every move. Needs FocusWatcher's D-Bus name."""
+
+    def __init__(self, folder: Path):
+        super().__init__()
+        self.at, self.running = None, False
+        self.script = folder / "cursor.js"
+        self.bus = QDBusConnection.sessionBus()
+        self.ok = self.bus.registerObject("/Cursor", self, QDBusConnection.ExportAllSlots)
+
+    @Slot(int, int)
+    def pos(self, x, y): self.at = (x, y)
+
+    def _kwin(self): return QDBusInterface("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", self.bus)
+
+    def start(self):
+        if self.running or not self.ok: return self.ok
+        self.script.write_text(CURSOR_SCRIPT)
+        k = self._kwin(); k.call("unloadScript", "chromascope-cursor")
+        k.call("loadScript", str(self.script), "chromascope-cursor"); k.call("start")
+        self.running = True; return True
+
+    def stop(self):
+        if self.running: self._kwin().call("unloadScript", "chromascope-cursor"); self.running = False; self.at = None
+
+
 class LockWatcher(QObject):
     """Polls whether the screen is locked (org.freedesktop.ScreenSaver.GetActive)."""
     changed = Signal(bool)

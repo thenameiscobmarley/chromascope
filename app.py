@@ -14,8 +14,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
+from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QInputDialog,
                                QLabel, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -23,9 +23,14 @@ import uivault3 as uv
 import tools
 from capture import MONITOR, WINDOW, Capture
 from detect import assist_layer, detect, fov_rect, hsv_of, sample, tint
-from extras import EXAMPLES, FocusWatcher, LockWatcher, Tour, UndoStack
+import nnio
+import nnmm
+from inputwatch import RightButton
+from extras import EXAMPLES, CursorWatcher, FocusWatcher, LockWatcher, Tour, UndoStack
 
 CONFIG = Path.home() / ".config" / "chromascope"
+MODELS = CONFIG / "models"                                    # imported models
+MODEL_DIRS = [MODELS, Path(__file__).resolve().parent / "models"]   # + the bundled ones (aim)
 PROFILES = CONFIG / "profiles"
 PROFILES.mkdir(parents=True, exist_ok=True)
 SETTINGS = CONFIG / "settings.json"
@@ -43,6 +48,7 @@ DEFAULTS = {
     "pause_locked": True, "pause_static": False, "pause_static_s": 30, "pause_focus": False, "focus_match": "",
     "history": [], "contrast_a": "#1a1917", "contrast_b": "#f4f2ee",
     "kit": "win98", "theme": "paper", "profile": "", "toured": False,
+    "nn_model": "aim", "nn_hold": "both",
 }
 # what a profile stores: everything about what to find and how to draw it, not window/capture/theme settings
 PROFILE_KEYS = ["colors", "sel", "min_area", "merge", "max_targets", "sort", "fov", "fov_shape", "fov_dx", "fov_dy",
@@ -53,7 +59,8 @@ RESET_KEYS = {"Detect": ["colors", "sel", "tolerance", "min_sat", "min_val", "mi
               "FOV": ["fov", "fov_shape", "fov_dx", "fov_dy", "show_fov", "crosshair", "max_fps"],
               "Draw": ["mode", "thickness", "glow", "labels", "hud", "assist", "assist_style", "assist_color"],
               "Setup": ["overlay_fov", "overlay_fps", "overlay_screen", "source", "cursor", "minimize",
-                        "pause_locked", "pause_static", "pause_static_s", "pause_focus", "focus_match"]}
+                        "pause_locked", "pause_static", "pause_static_s", "pause_focus", "focus_match"],
+              "NNMM": ["nn_model", "nn_hold"]}
 PRESETS = [("Red", "#ff2a2a"), ("Orange", "#ff8a00"), ("Yellow", "#ffe100"), ("Green", "#22e35a"),
            ("Cyan", "#00e5ff"), ("Blue", "#2a6bff"), ("Purple", "#b13cff"), ("Magenta", "#ff2ad4")]
 BOX_COLORS = [("Red", "#ff3b3b"), ("Lime", "#7CFF4F"), ("White", "#ffffff"), ("Cyan", "#2ae6ff"), ("Gold", "#ffc83a"), ("Pink", "#ff4fd8")]
@@ -84,6 +91,7 @@ def load_settings():
     except Exception: raw = {}
     cfg = {**DEFAULTS, **{k: v for k, v in raw.items() if k in DEFAULTS}}
     fix_colors(cfg, raw)
+    if cfg["nn_model"] in ("sandbox", "teacher"): cfg["nn_model"] = "aim"     # the old sandbox choices are gone
     return cfg
 
 
@@ -614,6 +622,9 @@ class Window(uv.Surface):
         self.undo_timer.timeout.connect(self.commit_undo)
         self.lock = LockWatcher(); self.lock.changed.connect(lambda _l: self.update_pause())
         self.focus = FocusWatcher(CONFIG); self.focus.changed.connect(lambda *_: self.update_pause())
+        self.cursor = CursorWatcher(CONFIG)
+        self.live = nnmm.Live(self.cfg, MODEL_DIRS, self.cursor, self.screen_map, self); self.live.changed.connect(self.show_live)
+        self.rbutton = RightButton(self.cfg["nn_hold"]); self.rbutton.held.connect(self.on_right)
 
         root = QVBoxLayout(self); root.setContentsMargins(22, 14, 22, 16); root.setSpacing(12)
         head = QHBoxLayout(); root.addLayout(head)
@@ -642,6 +653,9 @@ class Window(uv.Surface):
         self.b_hits, self.b_res = uv.Badge("0 hits", "success"), uv.Badge("—", "info")
         for b in (self.b_cap, self.b_proc, self.b_ms, self.b_hits, self.b_res): stats.addWidget(b)
         stats.addStretch(1)
+        self.mouse_sw = uv.Switch("NN mouse (F7)", False); self.mouse_sw.toggled.connect(self.set_live)
+        self.mouse_sw.setToolTip("NNMM live mouse: steer the mouse onto the nearest detected box (settings on the NNMM tab)")
+        stats.addWidget(self.mouse_sw)
 
         side = uv.Card(padding=16); side.setFixedWidth(470); body.addWidget(side)
         self.nav = uv.NavBar(TABS); side.layout().addWidget(self.nav)
@@ -651,6 +665,7 @@ class Window(uv.Surface):
 
         QShortcut(QKeySequence("F8"), self, self.toggle)
         QShortcut(QKeySequence("F9"), self, lambda: self.ov_switch.setChecked(not self.ov_switch.isChecked()))
+        QShortcut(QKeySequence("F7"), self, lambda: self.set_live(not self.live.on))
         QShortcut(QKeySequence("F10"), self, lambda: self.view_tabs.setCurrentIndex((self.view_tabs.currentIndex() + 1) % 3))
         QShortcut(QKeySequence("Escape"), self, self.cancel_modes)
         QShortcut(QKeySequence(QKeySequence.StandardKey.Undo), self, self.undo)
@@ -866,9 +881,99 @@ class Window(uv.Surface):
 
     def page_nnmm(self):
         p = Panel(self.cfg, self.changed, self.reg)
-        p.section("NNMM")
-        p.lay.addWidget(uv.Alert("Placeholder: nothing here yet.", "info"))
-        p.end(); return p
+        p.section("Neural-network mouse")
+        p.lay.addWidget(label("Load a model, start capture, turn this on, then hold right click: the model moves the mouse onto the "
+                              "nearest detected box. Let go to stop.", 11, muted=True))
+        row = QHBoxLayout(); row.addWidget(label("Model", 13)); row.addStretch(1)
+        self.model_box = QComboBox(); self.model_box.setMinimumWidth(200); self.fill_models()
+        self.model_box.activated.connect(lambda _i: self.pick_model(self.model_box.currentData()))
+        row.addWidget(self.model_box); p.lay.addLayout(row)
+        row = QHBoxLayout(); row.setSpacing(4)
+        for text, fn in (("Load model (.npz)…", self.import_model), ("Open models folder", self.open_models)):
+            b = uv.Button(text, size="sm"); b.clicked.connect(fn); row.addWidget(b)
+        row.addStretch(1); p.lay.addLayout(row)
+        self.model_msg = label(getattr(self, "model_note_text", "A model takes 6 inputs (target offset x/y, target speed x/y, current speed "
+                                                                "x/y) and gives 2 outputs (speed x/y). OpenCV DNN runs it."), 11, muted=True)
+        p.lay.addWidget(self.model_msg)
+        p.lay.addSpacing(6)
+        p.choice("Hold right click on", "nn_hold", [("Mouse or touchpad", "both"), ("Mouse", "mouse"), ("Touchpad", "touchpad")])
+        self.live_sw = uv.Switch("Enable (F7)", self.live.on); self.live_sw.toggled.connect(self.set_live); p.lay.addWidget(self.live_sw)
+        self.live_msg = label(self.live.status, 12, mono=True); self.live_msg.setWordWrap(True); p.lay.addWidget(self.live_msg)
+        self.input_msg = label(self.input_text(), 11, muted=True); p.lay.addWidget(self.input_msg)
+        p.end(lambda: (self.reset_tab("NNMM"), setattr(self.rbutton, "mode", self.cfg["nn_hold"]))); return p
+
+    # ── NNMM ─────────────────────────────────────────────────────────────────
+    def fill_models(self):
+        b = self.model_box; b.blockSignals(True); b.clear()
+        for n in sorted({n for f in MODEL_DIRS for n in nnio.names(f)}): b.addItem(n, n)
+        i = b.findData(self.cfg["nn_model"]); b.setCurrentIndex(max(0, i)); b.blockSignals(False)
+
+    def model_note(self, text):
+        self.model_note_text = text
+        if hasattr(self, "model_msg"): self.model_msg.setText(text)
+
+    def pick_model(self, name):
+        self.cfg["nn_model"] = name; save_settings(self.cfg)
+        if self.live.on and not self.live.load_model(): self.set_live(False)
+        self.show_live()
+
+    def import_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import model", str(Path.home()), "Models (*.npz *.onnx)")
+        if not path: return
+        try:
+            m = nnio.CvModel(path); bad = m.check()
+            if bad: raise ValueError(bad)
+        except Exception as e:  # noqa: BLE001 - show why (format, shape, OpenCV, doesn't steer)
+            self.model_note(f"Can't use that model: {e}"[:240]); return
+        MODELS.mkdir(parents=True, exist_ok=True); dst = MODELS / Path(path).name
+        dst.write_bytes(Path(path).read_bytes())
+        self.fill_models(); self.model_box.setCurrentIndex(self.model_box.findData(dst.stem)); self.pick_model(dst.stem)
+        self.model_note(f"Imported {dst.name} ({m.layers or 'ONNX'}); OpenCV runs it and it steers towards targets.")
+
+    def open_models(self):
+        MODELS.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(MODELS)))
+
+    def input_text(self):
+        mode = self.cfg["nn_hold"]
+        how = {"mouse": "Hold the mouse's right button", "touchpad": "Press and hold the touchpad's bottom-right corner (or press with two fingers)",
+               "both": "Hold the mouse's right button, or press and hold the touchpad's bottom-right corner"}[mode]
+        if not self.rbutton.thread: return f"{how} in any window to move, let go to stop. Turn on Enable to start listening."
+        if self.rbutton.denied and not self.rbutton.ok:
+            return "Can't read your mouse buttons (no access to /dev/input). Run ./setup.sh once (it asks for your password)."
+        kinds = ["mouse", "touchpad"] if mode == "both" else [mode]
+        found = [n for k in kinds for n in self.rbutton.names(k)]
+        if not found:
+            return f"No {' or '.join(kinds)} found yet. Plug one in; it's picked up within 2 s."
+        return f"{how}. Listening on: {', '.join(sorted(set(found)))}."
+
+    def on_right(self, down):
+        self.live.set_held(down)
+
+    def set_live(self, on):
+        if on == self.live.on: return
+        if on:
+            self.rbutton.start()
+            if not self.live.start(): self.rbutton.stop()
+            elif not self.running: self.live.status = "Enabled. Start capture (F8) so it can see targets."
+        else: self.live.stop(); self.rbutton.stop()
+        self.update_pause(); self.show_live()
+
+    def screen_map(self, w, h):
+        """Where the captured monitor sits on the desktop: (x, y, frame px per desktop px, height in desktop px)."""
+        screens = QApplication.screens()
+        g = screens[min(self.cfg["overlay_screen"], len(screens) - 1)].geometry()
+        return g.x(), g.y(), w / max(1, g.width()), g.height()
+
+    def show_live(self):
+        if not hasattr(self, "live_msg") or not hasattr(self, "mouse_sw"): return
+        l = self.live
+        txt = l.status + (f"\nmodel {l.model.name} · {l.targets} boxes detected · right click {'held' if l.held else 'up'}"
+                          f" · sent {l.counts} counts" if l.on and l.model else "")
+        if self.live_msg.text() != txt: self.live_msg.setText(txt)
+        t = self.input_text()
+        if self.input_msg.text() != t: self.input_msg.setText(t)
+        for sw in (self.live_sw, self.mouse_sw):
+            if sw.isChecked() != l.on: sw.blockSignals(True); sw.setChecked(l.on); sw.blockSignals(False)
 
     # ── colours ──────────────────────────────────────────────────────────────
     def sel(self): return self.cfg["colors"][self.cfg["sel"]]
@@ -1205,6 +1310,7 @@ class Window(uv.Surface):
             if key == "tolerance": self.render_colors()
         if key == "overlay_screen" and self.overlay.isVisible(): self.overlay.show_on(self.cfg["overlay_screen"])
         if key.startswith("pause_") or key == "focus_match": self.update_pause()
+        if key == "nn_hold": self.rbutton.mode = self.cfg["nn_hold"]; self.show_live()
         save_settings(self.cfg); self.preview.update(); self.overlay.update()
         if not self.restoring and key in UNDO_KEYS + ["tolerance", "min_sat", "min_val", "fov"]: self.undo_timer.start()
 
@@ -1222,6 +1328,7 @@ class Window(uv.Surface):
 
     def on_paused(self, reason):
         self.preview.paused = reason; self.preview.update()
+        if reason: self.live.feed(None, f"capture is paused ({reason})")
         if reason:
             self.set_status("Paused", "warn"); self.status.setToolTip(reason)
             self.overlay.data = None; self.overlay.update()
@@ -1239,7 +1346,7 @@ class Window(uv.Surface):
 
     def toggle(self):
         if self.running:
-            self.engine.stop_capture(); self.engine = None; self.running = False
+            self.engine.stop_capture(); self.engine = None; self.running = False; self.live.feed(None)
             self.go.setText("Start capture"); self.set_status("Idle", "warn")
             self.preview.data = None; self.preview.paused = ""; self.preview.update(); self.overlay.data = None; self.overlay.update()
             if self.preview.eyedrop: self.stop_eyedrop()
@@ -1272,6 +1379,7 @@ class Window(uv.Surface):
         if self.engine.cap.restore_token and self.engine.cap.restore_token != self.cfg["restore_token"]:
             self.cfg["restore_token"] = self.engine.cap.restore_token; save_settings(self.cfg)
         self.preview.show_frame(d)
+        self.live.feed(d)
         if self.overlay.isVisible():
             self.overlay.show_frame(d); self.engine.overlay_scale = self.overlay.scale()
         w, h = d["size"]
@@ -1311,7 +1419,7 @@ class Window(uv.Surface):
 
     def closeEvent(self, e):
         if self.engine: self.engine.stop_capture()
-        self.focus.stop(); self.overlay.close(); super().closeEvent(e)
+        self.live.stop(); self.rbutton.stop(); self.focus.stop(); self.overlay.close(); super().closeEvent(e)
 
 
 def main():

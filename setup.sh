@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ChromaScope setup: installs the system packages + Python dependencies and adds ChromaScope to the app menu.
 #   ./setup.sh             install / update
-#   ./setup.sh --uninstall remove the menu entry, icon and KWin rules (keeps this folder and your settings)
+#   ./setup.sh --uninstall remove the menu entry, icon, KWin rules and udev rule (keeps this folder and your settings)
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 APPS="$HOME/.local/share/applications"
@@ -15,6 +15,7 @@ refresh_menu() {
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     rm -f "$APPS/chromascope.desktop" "$ICONS/chromascope.svg"
+    [[ -f /etc/udev/rules.d/70-chromascope.rules ]] && sudo rm -f /etc/udev/rules.d/70-chromascope.rules && sudo udevadm control --reload
     if command -v kwriteconfig6 >/dev/null; then
         rules=$(kreadconfig6 --file kwinrulesrc --group General --key rules | tr ',' '\n' | { grep -v '^chromascope-' || true; } | paste -sd, -)
         kwriteconfig6 --file kwinrulesrc --group General --key rules "$rules"
@@ -53,7 +54,21 @@ else
     "$DIR/.venv/bin/pip" install -q "git+https://github.com/thenameiscobmarley/ui-vault#subdirectory=uivault3"
 fi
 
-# 3. App menu entry + icon
+# 3. Device access for the NNMM tab: create the virtual mouse (/dev/uinput) and read mouse / touchpad buttons for
+#    hold-right-click-to-aim. uaccess = only the user logged in at the screen; keyboards stay off limits.
+RULES=/etc/udev/rules.d/70-chromascope.rules
+if [[ ! -f "$RULES" ]]; then
+    say "Allowing ChromaScope to use a virtual mouse and read mouse buttons (udev rule, asks for your password)"
+    sudo tee "$RULES" >/dev/null <<'UDEV'
+# ChromaScope NNMM: virtual mouse + read-only mouse/touchpad buttons for the logged-in user
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHPAD}=="1", TAG+="uaccess"
+UDEV
+    sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=input --subsystem-match=misc
+fi
+
+# 4. App menu entry + icon
 say "Adding ChromaScope to the app menu"
 mkdir -p "$APPS" "$ICONS"
 cp "$DIR/assets/chromascope.svg" "$ICONS/chromascope.svg"
@@ -73,7 +88,7 @@ StartupWMClass=chromascope
 DESKTOP
 refresh_menu
 
-# 4. Self-check
+# 5. Self-check
 say "Checking"
 "$DIR/.venv/bin/python" - <<'PY'
 import gi; gi.require_version("Gst", "1.0")
