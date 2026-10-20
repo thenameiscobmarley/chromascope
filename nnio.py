@@ -135,6 +135,28 @@ def load_npz(path, n_in=6):
     return W, b, act, out_act
 
 
+def is_aimer(path):
+    """True for an aim-trainer model (aimer/ runtime: policy pi0, pi1 … plus obs_dim), not a plain 6 → 2 net."""
+    if Path(path).suffix != ".npz": return False
+    with np.load(path, allow_pickle=False) as z: return "pi0" in z.files and "obs_dim" in z.files
+
+
+class CvPolicy:
+    """An aim-trainer policy network run by OpenCV DNN (same maths as aimer.policy.Policy.mean)."""
+
+    def __init__(self, path):
+        from aimer.policy import Policy                         # widens older 27 / 49-input models
+        pol = Policy.load(path)
+        P = pol.pi.params
+        self.name, self.meta, self.inputs = Path(path).stem, pol.meta, P[0].shape[0]
+        self.layers = " → ".join([str(P[0].shape[0])] + [str(w.shape[1]) for w in P[0::2]]) + " (aimer)"
+        self.net = cv2.dnn.readNetFromONNX(np.frombuffer(to_onnx(P[0::2], P[1::2]), np.uint8))
+
+    def mean(self, x):
+        self.net.setInput(np.asarray(x, np.float32).reshape(1, -1))
+        return np.asarray(self.net.forward(), np.float32).reshape(1, -1)
+
+
 class CvModel:
     """A model run by OpenCV DNN: 6 floats in, 2 floats out. From a .npz (converted to ONNX in memory) or an .onnx file."""
 

@@ -48,7 +48,7 @@ DEFAULTS = {
     "pause_locked": True, "pause_static": False, "pause_static_s": 30, "pause_focus": False, "focus_match": "",
     "history": [], "contrast_a": "#1a1917", "contrast_b": "#f4f2ee",
     "kit": "win98", "theme": "paper", "profile": "", "toured": False,
-    "nn_model": "aim", "nn_hold": "both",
+    "nn_model": "aim", "nn_hold": "both", "nn_color": "",
 }
 # what a profile stores: everything about what to find and how to draw it, not window/capture/theme settings
 PROFILE_KEYS = ["colors", "sel", "min_area", "merge", "max_targets", "sort", "fov", "fov_shape", "fov_dx", "fov_dy",
@@ -60,7 +60,7 @@ RESET_KEYS = {"Detect": ["colors", "sel", "tolerance", "min_sat", "min_val", "mi
               "Draw": ["mode", "thickness", "glow", "labels", "hud", "assist", "assist_style", "assist_color"],
               "Setup": ["overlay_fov", "overlay_fps", "overlay_screen", "source", "cursor", "minimize",
                         "pause_locked", "pause_static", "pause_static_s", "pause_focus", "focus_match"],
-              "NNMM": ["nn_model", "nn_hold"]}
+              "NNMM": ["nn_model", "nn_hold", "nn_color"]}
 PRESETS = [("Red", "#ff2a2a"), ("Orange", "#ff8a00"), ("Yellow", "#ffe100"), ("Green", "#22e35a"),
            ("Cyan", "#00e5ff"), ("Blue", "#2a6bff"), ("Purple", "#b13cff"), ("Magenta", "#ff2ad4")]
 BOX_COLORS = [("Red", "#ff3b3b"), ("Lime", "#7CFF4F"), ("White", "#ffffff"), ("Cyan", "#2ae6ff"), ("Gold", "#ffc83a"), ("Pink", "#ff4fd8")]
@@ -234,6 +234,33 @@ def draw_targets(p, targets, to_px, cfg, colors, overlay=False):
             p.drawText(chip, Qt.AlignCenter, txt)
 
 
+LOCK = QColor("#00E5FF")
+
+
+def draw_lock(p, lock, to_px):
+    """NNMM: the box it's steering to (corner brackets + aim cross) and a line from the pointer to it."""
+    if not lock: return
+    pt = lambda xy: to_px(QRectF(xy[0], xy[1], 0, 0)).topLeft()  # noqa: E731
+    r = to_px(QRectF(*lock["box"])).adjusted(-7, -7, 7, 7)
+    aim, cur = pt(lock["aim"]), pt(lock["cur"])
+    dark = QColor(0, 0, 0, 150)
+    for col, w in ((dark, 5), (LOCK, 2.5)):                      # dark halo underneath so it shows on any background
+        p.setPen(QPen(col, w, Qt.SolidLine, Qt.SquareCap)); p.setBrush(Qt.NoBrush)
+        L = max(8.0, min(r.width(), r.height()) * 0.3)
+        for (x, y, dx, dy) in ((r.left(), r.top(), 1, 1), (r.right(), r.top(), -1, 1),
+                               (r.left(), r.bottom(), 1, -1), (r.right(), r.bottom(), -1, -1)):
+            p.drawLine(QPointF(x, y), QPointF(x + dx * L, y)); p.drawLine(QPointF(x, y), QPointF(x, y + dy * L))
+        p.drawLine(aim - QPointF(6, 0), aim + QPointF(6, 0)); p.drawLine(aim - QPointF(0, 6), aim + QPointF(0, 6))
+    for col, w in ((dark, 4), (LOCK, 1.8)):
+        p.setPen(QPen(col, w, Qt.DashLine, Qt.RoundCap)); p.drawLine(cur, aim)
+    p.setPen(QPen(dark, 3)); p.setBrush(LOCK); p.drawEllipse(cur, 4, 4)
+    f = QFont("Geist Mono"); f.setPixelSize(11); f.setBold(True); p.setFont(f)
+    txt = f"LOCKED  {lock['dist']:.0f} px"
+    chip = QRectF(r.left(), r.bottom() + 4, p.fontMetrics().horizontalAdvance(txt) + 12, 17)   # below: the colour label sits above
+    p.setPen(Qt.NoPen); p.setBrush(LOCK); p.drawRoundedRect(chip, 4, 4)
+    p.setPen(QColor("#00262b")); p.drawText(chip, Qt.AlignCenter, txt)
+
+
 def draw_fov(p, fov, to_px, cfg, ring_pad=0, active=False):
     if cfg["fov_shape"] == "full": return
     fx, fy, fw, fh = fov
@@ -254,6 +281,7 @@ class Preview(QWidget):
     def __init__(self, cfg):
         super().__init__()
         self.cfg, self.data, self.sampling, self.eyedrop = cfg, None, False, False
+        self.live = None                         # NNMM controller, to draw what it has locked onto
         self.pixel = None                    # callable (x, y) -> (rgb, 11x11 RGB crop) | None, set by the window
         self.hover, self.paused = None, ""
         self.drag = None                     # ("sample", start QPointF, cur QPointF) | ("move"/"size", …)
@@ -314,6 +342,7 @@ class Preview(QWidget):
             c = g.center(); p.setPen(QPen(QColor(255, 255, 255, 170), 1.2))
             p.drawLine(QPointF(c.x() - 7, c.y()), QPointF(c.x() + 7, c.y())); p.drawLine(QPointF(c.x(), c.y() - 7), QPointF(c.x(), c.y() + 7))
         draw_targets(p, d["targets"], to_px, cfg, d["colors"])
+        if self.live is not None: draw_lock(p, self.live.lock(), to_px)
         if cfg["hud"]:
             f = QFont("Geist Mono"); f.setPixelSize(12); f.setBold(True); p.setFont(f)
             txt = f"{d['fps']:5.1f} FPS   {d['ms']:4.1f} ms   {len(d['targets'])} hit{'s' if len(d['targets']) != 1 else ''}"
@@ -425,7 +454,7 @@ class Overlay(QWidget):
     def __init__(self, cfg):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowTransparentForInput
                          | Qt.WindowDoesNotAcceptFocus | Qt.Tool)
-        self.cfg, self.data = cfg, None
+        self.cfg, self.data, self.live = cfg, None, None
         self.setWindowTitle(OVERLAY_TITLE)
         self.setAttribute(Qt.WA_TranslucentBackground); self.setAttribute(Qt.WA_ShowWithoutActivating)
 
@@ -452,6 +481,7 @@ class Overlay(QWidget):
                 p.setRenderHint(QPainter.SmoothPixmapTransform, False); p.drawImage(to_px(QRectF(*d["fov"])), d["assist"])
             if cfg["overlay_fov"]: draw_fov(p, d["fov"], to_px, cfg, ring_pad=4)
             draw_targets(p, d["targets"], to_px, cfg, d["colors"], overlay=True)
+            if self.live is not None: draw_lock(p, self.live.lock(), to_px)
             if cfg["overlay_fps"]:
                 f = QFont("Geist Mono"); f.setPixelSize(13); f.setBold(True); p.setFont(f)
                 txt = f"ChromaScope  {d['fps']:.0f} FPS  {len(d['targets'])} hits"
@@ -646,6 +676,8 @@ class Window(uv.Surface):
         body = QHBoxLayout(); body.setSpacing(16); root.addLayout(body, 1)
         left = QVBoxLayout(); left.setSpacing(10); body.addLayout(left, 1)
         self.preview = Preview(self.cfg); self.preview.pixel = self.pixel_at
+        self.preview.live = self.overlay.live = self.live
+        self.live.lockChanged.connect(lambda: (self.preview.update(), self.overlay.isVisible() and self.overlay.update()))
         self.preview.sampled.connect(self.sample_at); self.preview.fovMoved.connect(self.fov_moved); self.preview.picked.connect(self.eye_picked)
         left.addWidget(self.preview, 1)
         stats = QHBoxLayout(); stats.setSpacing(6); left.addLayout(stats)
@@ -892,10 +924,15 @@ class Window(uv.Surface):
         for text, fn in (("Load model (.npz)…", self.import_model), ("Open models folder", self.open_models)):
             b = uv.Button(text, size="sm"); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(1); p.lay.addLayout(row)
-        self.model_msg = label(getattr(self, "model_note_text", "A model takes 6 inputs (target offset x/y, target speed x/y, current speed "
-                                                                "x/y) and gives 2 outputs (speed x/y). OpenCV DNN runs it."), 11, muted=True)
+        self.model_msg = label(getattr(self, "model_note_text", "Aim-trainer models (expert-…) run with their own estimator and "
+                                                                "snap/track brain; plain models take 6 inputs (target offset, target speed, current speed) "
+                                                                "and give 2 (speed x/y). OpenCV DNN runs the network either way."), 11, muted=True)
         p.lay.addWidget(self.model_msg)
         p.lay.addSpacing(6)
+        row = QHBoxLayout(); row.addWidget(label("Go for", 13)); row.addStretch(1)
+        self.nn_colour_box = QComboBox(); self.nn_colour_box.setMinimumWidth(200); self.fill_nn_colours()
+        self.nn_colour_box.activated.connect(lambda _i: self.changed_nn_colour(self.nn_colour_box.currentData()))
+        row.addWidget(self.nn_colour_box); p.lay.addLayout(row)
         p.choice("Hold right click on", "nn_hold", [("Mouse or touchpad", "both"), ("Mouse", "mouse"), ("Touchpad", "touchpad")])
         self.live_sw = uv.Switch("Enable (F7)", self.live.on); self.live_sw.toggled.connect(self.set_live); p.lay.addWidget(self.live_sw)
         self.live_msg = label(self.live.status, 12, mono=True); self.live_msg.setWordWrap(True); p.lay.addWidget(self.live_msg)
@@ -907,6 +944,19 @@ class Window(uv.Surface):
         b = self.model_box; b.blockSignals(True); b.clear()
         for n in sorted({n for f in MODEL_DIRS for n in nnio.names(f)}): b.addItem(n, n)
         i = b.findData(self.cfg["nn_model"]); b.setCurrentIndex(max(0, i)); b.blockSignals(False)
+
+    def fill_nn_colours(self):
+        """'Go for' list: any colour, or one of the Detect tab's colours (stored by name, so reordering doesn't break it)."""
+        b = getattr(self, "nn_colour_box", None)
+        if b is None: return
+        want = self.cfg["nn_color"]
+        b.blockSignals(True); b.clear(); b.addItem("Any detected colour", "")
+        for c in self.cfg["colors"]: b.addItem(c["name"], c["name"])
+        if want and b.findData(want) < 0: b.addItem(f"{want} (missing)", want)
+        b.setCurrentIndex(max(0, b.findData(want))); b.blockSignals(False)
+
+    def changed_nn_colour(self, name):
+        self.cfg["nn_color"] = name; save_settings(self.cfg); self.live.lose()
 
     def model_note(self, text):
         self.model_note_text = text
@@ -921,8 +971,10 @@ class Window(uv.Surface):
         path, _ = QFileDialog.getOpenFileName(self, "Import model", str(Path.home()), "Models (*.npz *.onnx)")
         if not path: return
         try:
-            m = nnio.CvModel(path); bad = m.check()
-            if bad: raise ValueError(bad)
+            if nnio.is_aimer(path): m = nnio.CvPolicy(path)      # aim-trainer model: runs with the aimer/ runtime
+            else:
+                m = nnio.CvModel(path); bad = m.check()
+                if bad: raise ValueError(bad)
         except Exception as e:  # noqa: BLE001 - show why (format, shape, OpenCV, doesn't steer)
             self.model_note(f"Can't use that model: {e}"[:240]); return
         MODELS.mkdir(parents=True, exist_ok=True); dst = MODELS / Path(path).name
@@ -967,13 +1019,13 @@ class Window(uv.Surface):
     def show_live(self):
         if not hasattr(self, "live_msg") or not hasattr(self, "mouse_sw"): return
         l = self.live
-        txt = l.status + (f"\nmodel {l.model.name} · {l.targets} boxes detected · right click {'held' if l.held else 'up'}"
+        txt = l.status + (f"\nmodel {l.model.name} · {l.targets} box{'es' if l.targets != 1 else ''} detected · right click {'held' if l.held else 'up'}"
                           f" · sent {l.counts} counts" if l.on and l.model else "")
         if self.live_msg.text() != txt: self.live_msg.setText(txt)
         t = self.input_text()
         if self.input_msg.text() != t: self.input_msg.setText(t)
         for sw in (self.live_sw, self.mouse_sw):
-            if sw.isChecked() != l.on: sw.blockSignals(True); sw.setChecked(l.on); sw.blockSignals(False)
+            if sw.isChecked() != l.on: sw.setChecked(l.on)         # its toggled -> set_live() is a no-op by then; keeps the knob animating
 
     # ── colours ──────────────────────────────────────────────────────────────
     def sel(self): return self.cfg["colors"][self.cfg["sel"]]
@@ -991,6 +1043,7 @@ class Window(uv.Surface):
             r.renamed.connect(lambda i=i: self.rename_color(i))
             self.color_box.addWidget(r)
         self.add_btn.setEnabled(len(self.cfg["colors"]) < MAX_COLORS)
+        self.fill_nn_colours()
 
     def select_color(self, i):
         if i == self.cfg["sel"]: return
@@ -1017,7 +1070,9 @@ class Window(uv.Surface):
     def rename_color(self, i):
         c = self.cfg["colors"][i]
         name, ok = QInputDialog.getText(self, "Rename colour", "Name:", text=c["name"])
-        if ok and name.strip(): c["name"] = name.strip()[:24]; self.render_colors(); self.changed("colors")
+        if ok and name.strip():
+            if self.cfg["nn_color"] == c["name"]: self.cfg["nn_color"] = name.strip()[:24]   # NNMM keeps going for it
+            c["name"] = name.strip()[:24]; self.render_colors(); self.changed("colors")
 
     def set_color(self, col, name=None):
         s = self.sel()
