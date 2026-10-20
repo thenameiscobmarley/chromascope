@@ -6,6 +6,7 @@ Keys: F8 start/stop capture · F9 overlay on/off · F10 preview mode
 from __future__ import annotations
 
 import json
+import threading
 from collections import deque
 import re
 import subprocess
@@ -47,7 +48,7 @@ DEFAULTS = {
     "pause_locked": True, "pause_static": False, "pause_static_s": 30, "pause_focus": False, "focus_match": "",
     "history": [], "contrast_a": "#1a1917", "contrast_b": "#f4f2ee",
     "kit": "win98", "theme": "paper", "profile": "", "toured": False,
-    "nn_model_path": "", "nn_aim_mode": "pointer", "nn_hold": "both", "nn_color": "",
+    "nn_model_path": "", "nn_aim_mode": "pointer", "nn_hold": "both", "nn_color": "", "nn_step_ms": 66.7,
 }
 # what a profile stores: everything about what to find and how to draw it, not window/capture/theme settings
 PROFILE_KEYS = ["colors", "sel", "min_area", "merge", "max_targets", "sort", "fov", "fov_shape", "fov_dx", "fov_dy",
@@ -126,6 +127,7 @@ class Engine(QThread):
         self.overlay_scale = 1.0          # overlay logical px per frame px (set by the UI)
         self.overlay_seen = None          # self-test: can the capture see our overlay? None = not known yet
         self.window_rect = None           # our own window in frame px, when the capture can see it (cut out of detection)
+        self.ui_free = threading.Event(); self.ui_free.set()   # the UI finished the last frame: frames never queue up
 
     def start_capture(self):
         c = self.cfg
@@ -166,6 +168,7 @@ class Engine(QThread):
             reason = cfg.get("_pause") or ("screen hasn't changed" if cfg["pause_static"] and now - changed_at > cfg["pause_static_s"] else "")
             if reason != self.reason: self.reason = reason; self.pausedChanged.emit(reason)
             if reason: continue
+            if not self.ui_free.is_set(): continue                # UI still busy with the last one: skip, so no backlog (= lag)
             if now < next_t: time.sleep(next_t - now)
             next_t = time.monotonic() + 1.0 / max(1, cfg["max_fps"])
             t = time.perf_counter()
@@ -179,7 +182,8 @@ class Engine(QThread):
             n += 1
             if time.monotonic() - t0 >= 0.5: fps, n, t0 = n / (time.monotonic() - t0), 0, time.monotonic()
             history.append(targets)
-            self.frameReady.emit({"image": img, "src": src, "targets": targets, "fov": fov, "size": frame.shape[1::-1],
+            self.ui_free.clear()
+            self.frameReady.emit({"t": now, "image": img, "src": src, "targets": targets, "fov": fov, "size": frame.shape[1::-1],
                                   "assist": assist, "colors": cfg["colors"], "ms": ms, "fps": fps, "cap_fps": self.cap.fps})
 
     def _preview(self, frame, mask, fov, cfg):
@@ -1035,6 +1039,7 @@ class Window(uv.Surface):
 
     def on_right(self, down):
         self.live.set_held(down)
+        if not down: save_settings(self.cfg)                       # keeps the measured step rate (nn_step_ms)
 
     def set_live(self, on):
         if on == self.live.on: return
@@ -1511,6 +1516,11 @@ class Window(uv.Surface):
         self.set_status(msg[:60], "danger")
 
     def on_frame(self, d):
+        try: self._on_frame(d)
+        finally:
+            if self.engine is not None: self.engine.ui_free.set()
+
+    def _on_frame(self, d):
         if not self.running: return
         if self.engine.cap.restore_token and self.engine.cap.restore_token != self.cfg["restore_token"]:
             self.cfg["restore_token"] = self.engine.cap.restore_token; save_settings(self.cfg)

@@ -8,6 +8,7 @@ real position comes from KWin, 120 times a second. The model is always a file th
 from __future__ import annotations
 
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,13 @@ class Live(QObject):
         self.status, self.counts, self.frames, self.targets = "Off", 0, 0, 0
         self.map, self.box, self.colour_note = None, None, ""      # last frame's screen map; locked box (frame px)
         self.cur_frame = None                                      # where the "crosshair" was last frame (frame px)
+        # Crosshair: the aimer was trained for 0-4 frames between a move and seeing it. Capture latency (game → screen →
+        # capture → detection) easily exceeds that at 60 steps/s, and then it overshoots wildly. So the latency is measured
+        # from our own moves, and the aimer is stepped every latency/3 s: it always sees about 3 frames of delay.
+        self.step_iv, self.lat = cfg["nn_step_ms"] / 1000, deque(maxlen=7)   # saved from last time; 67 ms (15/s) at first
+        self.t_step, self.lat_probe, self.step_next = None, None, None
+        self.reached, self.slowed, self.dmin, self.unseen = False, 0, None, 0   # overshoot guard (see aim_step)
+        self.since_best = np.zeros(2)                              # counts sent since the closest approach (to undo)
         self.lose()
 
     def lose(self):
@@ -84,7 +92,10 @@ class Live(QObject):
         self.changed.emit()
 
     def set_held(self, down):
-        self.held = down; self.lose()
+        self.held = down; self.lose(); self.t_step = self.lat_probe = None; self.reached, self.dmin, self.unseen = False, None, 0
+        self.since_best = np.zeros(2)
+        if down and self.step_next: self.step_iv, self.step_next = self.step_next, None
+        self.cfg["nn_step_ms"] = round(self.step_iv * 1000, 1)     # remembered for next time (app saves settings)
         if self.aimer is not None and down: self.aimer.reset()   # every hold starts fresh: nothing learned earlier carries over
         if self.on and not down: self.status = "Ready: hold right click to move the mouse"; self.changed.emit()
 
@@ -97,8 +108,10 @@ class Live(QObject):
             if not Path(path).is_file(): raise FileNotFoundError(f"{path} doesn't exist")
             if nnio.is_aimer(path):
                 # Aim-trainer model: its own estimator + snap/track brain, the network (run by OpenCV) corrects the plan.
-                # whole_counts: uinput only takes whole counts, the runtime carries the rest itself.
-                self.aimer = Aimer(None, whole_counts=True)
+                # whole_counts: uinput only takes whole counts, the runtime carries the rest itself. fire="hold": its
+                # hold-to-fire training (stay on a target that doesn't go away), which is what ChromaScope does; in the
+                # default click mode it expects the target to vanish after each of its own clicks, and jitters more.
+                self.aimer = Aimer(None, whole_counts=True, fire="hold")
                 self.model = self.aimer.policy = nnio.CvPolicy(path); self.aimer.use_model = True
                 return True
             model = nnio.CvModel(path)
@@ -146,6 +159,9 @@ class Live(QObject):
             cur = np.array([(self.cursor.at[0] - sx) * k, (self.cursor.at[1] - sy) * k])
         self.cur_frame = cur
         boxes = [(np.array([t.x + t.w / 2, t.y + t.h / 2]), t) for t in targets]
+        if self.crosshair: self.watch_latency(d, boxes)
+        if self.crosshair and self.t_step is not None and d.get("t", time.monotonic()) - self.t_step < self.step_iv * 0.9:
+            return                                                 # between aimer steps (see step_iv)
         if not boxes:
             if self.aimer is not None: self.aim_step(d, None, cur)   # it was trained for targets that drop out for a while
             self.lose(); self.why = "nothing detected" + (f" in {self.cfg['nn_color']}" if self.cfg["nn_color"] and not self.colour_note else "")
@@ -162,6 +178,41 @@ class Live(QObject):
             self.goal_v = 0.6 * self.goal_v + 0.4 * np.clip((goal - self.goal) / (now - self.t_goal), -3000, 3000)
         self.goal, self.t_goal = goal, now
 
+    def overshoot(self):
+        """The aimer lost it badly (more delay than it was trained for, whatever the cause): crosshair steps it less
+        often from now on, and either way it starts over."""
+        # Turn back by everything sent since the closest approach (a camera turns linearly with counts), so the target
+        # is in view again instead of somewhere behind us.
+        back = -self.since_best
+        while np.hypot(*back) >= 1:
+            c = np.clip(back, -400, 400); ix, iy = self.mouse.move(*c); back -= (ix, iy)
+            if not (ix or iy): break
+        self.since_best = np.zeros(2)
+        self.reached, self.dmin, self.unseen = False, None, 0; self.slowed += 1; self.aimer.reset(); self.t_step = None
+        if self.crosshair: self.step_iv, self.step_next = min(0.2, max(self.step_iv * 2, 1 / 15)), None
+
+    def watch_latency(self, d, boxes):
+        """After a clear move, time until the target has shifted at least half the expected way (crosshair mode only)."""
+        lp, now = self.lat_probe, d.get("t", time.monotonic())
+        if lp is None or not boxes: return
+        t0, p0, c, expect = lp
+        if now - t0 > 0.6: self.lat_probe = None; return          # never saw it: try again on a later move
+        p = min(boxes, key=lambda q: np.hypot(*(q[0] - p0)))[0]
+        along = float(np.dot(p - p0, -c / np.hypot(*c)))           # the view turns the other way from the move
+        if along < 0.5 * expect: return
+        self.lat.append(now - t0); self.lat_probe = None
+        iv = float(np.clip(np.median(self.lat) / 3, 1 / 60, 0.2))
+        if len(self.lat) >= 3 and iv > 1.3 * self.step_iv:         # too fast for this latency: slow down now, start over
+            self.step_iv = iv; self.aimer.reset(); self.t_step = None
+        elif len(self.lat) >= 3: self.step_next = iv              # faster is fine: from the next hold on
+
+    def start_probe_timer(self, now, t, counts, W):
+        """Time this move if it should visibly shift the target (≥ 10 px by the aimer's own sensitivity estimate)."""
+        b = self.aimer.brain
+        if not hasattr(b, "G") or self.aimer.status().get("confidence", 0) < 1: return
+        expect = float(b.G[0] * np.hypot(*counts) * W / 2)
+        if expect >= 10: self.lat_probe = (now, np.array([t.x + t.w / 2, t.y + t.h / 2]), np.asarray(counts, float), expect)
+
     def aim_step(self, d, t, cur):
         """Aim-trainer runtime, once per frame; t = the chosen box, or None when nothing is visible this frame.
         Crosshair (3D): the target as seen, the crosshair is the screen centre, exactly how the runtime was trained.
@@ -170,19 +221,38 @@ class Live(QObject):
         w, h = d["size"]
         sx, sy, k = self.map
         W, H = w / k, h / k                                      # crosshair: frame px; pointer: desktop px
+        now = d.get("t", time.monotonic())
+        dt = None                                                  # this step's length vs the usual one (uneven frames)
+        if self.crosshair and self.t_step is not None: dt = float(np.clip((now - self.t_step) / self.step_iv, 0.5, 3))
+        self.t_step = now
         if t is None:
-            out = self.aimer.step_target((W / 2, H / 2), False, None, None, W, H)
+            out = self.aimer.step_target((W / 2, H / 2), False, None, None, W, H, dt=dt)
             xy = None
         else:
             xy = ((t.x + t.w / 2 - cur[0]) / k + W / 2, (t.y + t.h / 2 - cur[1]) / k + H / 2)
             bw, bh = t.w / k, t.h / k
-            out = self.aimer.step_target(xy, True, max(1.0, float(np.sqrt(bw * bh / np.pi))), (bw, bh), W, H)
+            out = self.aimer.step_target(xy, True, max(1.0, float(np.sqrt(bw * bh / np.pi))), (bw, bh), W, H, dt=dt)
         ix, iy = self.mouse.move(*np.clip(out.counts, -400, 400))
-        self.aimer.applied((ix, iy)); self.counts += abs(ix) + abs(iy)
-        if xy is None: return
+        self.aimer.applied((ix, iy)); self.counts += abs(ix) + abs(iy); self.since_best += (ix, iy)
+        if self.crosshair and t is not None and self.lat_probe is None and (ix or iy): self.start_probe_timer(now, t, (ix, iy), W)
+        if xy is None:
+            self.unseen += 1
+            if self.crosshair and self.dmin is not None and self.unseen * self.step_iv > 1.0: self.overshoot()   # spun away
+            return
+        self.unseen = 0
         st = self.aimer.status()
         dist = float(np.hypot(xy[0] - W / 2, xy[1] - H / 2))
-        self.say(f"Moving ({self.model.name}, {st.get('mode', '…')}, delay {st.get('delay', 0)}) · {dist:.0f} px from target"
+        # Overshoot guard: it was on the target and now it's far off. That's the aimer seeing more delay than it was
+        # trained for (whatever the cause), so step it less often and start it over.
+        size = max(t.w, t.h) / k
+        if st.get("mode") != "probing" and (self.dmin is None or dist <= self.dmin):
+            self.dmin = dist; self.since_best = np.array([ix, iy], float)   # this frame shows the view before this move
+        if dist < max(20.0, size): self.reached = True
+        elif (self.reached and dist > max(250.0, 8 * size)) or (self.dmin is not None and dist > max(400.0, 3 * self.dmin)):
+            self.overshoot()
+        lat = f" · latency {np.median(self.lat) * 1000:.0f} ms, {1 / self.step_iv:.0f} steps/s" if self.crosshair and self.lat else ""
+        if self.slowed: lat += f" · overshoot caught {self.slowed}×"
+        self.say(f"Moving ({self.model.name}, {st.get('mode', '…')}) · {dist:.0f} px from target{lat}"
                  + (f" · {self.colour_note}" if self.colour_note else ""))
 
     def tick(self):
