@@ -6,6 +6,7 @@ Keys: F8 start/stop capture · F9 overlay on/off · F10 preview mode
 from __future__ import annotations
 
 import json
+from collections import deque
 import re
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QFileDialo
 import uivault3 as uv
 import tools
 from capture import MONITOR, WINDOW, Capture
-from detect import assist_layer, detect, fov_rect, hsv_of, sample, tint
+from detect import assist_layer, detect, find_probes, fov_rect, hsv_of, sample, tint
 import nnio
 import nnmm
 from inputwatch import RightButton
@@ -123,6 +124,8 @@ class Engine(QThread):
         super().__init__()
         self.cfg, self.cap, self.last_frame, self.reason = cfg, Capture(), None, ""
         self.overlay_scale = 1.0          # overlay logical px per frame px (set by the UI)
+        self.overlay_seen = None          # self-test: can the capture see our overlay? None = not known yet
+        self.window_rect = None           # our own window in frame px, when the capture can see it (cut out of detection)
 
     def start_capture(self):
         c = self.cfg
@@ -140,8 +143,15 @@ class Engine(QThread):
         band = int(2 * pad + 6)
         return [(int(t.x - pad), int(t.y - pad), int(t.w + 2 * pad), int(t.h + 2 * pad), band) for t in targets]
 
+    def ignore_now(self, history, cfg):
+        """What detection must skip this frame: our own window (if the capture sees it) and our overlay drawings."""
+        out = [(*self.window_rect, -1)] if self.window_rect else []
+        if self.overlay_seen is not None: return out             # hidden from capture, or seen but drawn colourless: nothing to skip
+        return out + (self._ignore(history[-1], cfg) if history else [])   # not known yet: last frame's outlines
+
     def run(self):
-        last, prev, n, t0, fps, next_t = 0, [], 0, time.monotonic(), 0.0, 0.0
+        last, n, t0, fps, next_t = 0, 0, time.monotonic(), 0.0, 0.0
+        history = deque(maxlen=8)        # boxes the overlay drew over the last frames
         sig, changed_at = None, time.monotonic()
         while not self.isInterruptionRequested():
             if self.cap.error: self.failed.emit(self.cap.error); return
@@ -159,7 +169,7 @@ class Engine(QThread):
             if now < next_t: time.sleep(next_t - now)
             next_t = time.monotonic() + 1.0 / max(1, cfg["max_fps"])
             t = time.perf_counter()
-            targets, mask, fov = detect(frame, cfg, self._ignore(prev, cfg))
+            targets, mask, fov = detect(frame, cfg, self.ignore_now(history, cfg))
             img, src = self._preview(frame, mask, fov, cfg)
             assist = None
             if cfg["assist"]:
@@ -168,7 +178,7 @@ class Engine(QThread):
             ms = (time.perf_counter() - t) * 1000
             n += 1
             if time.monotonic() - t0 >= 0.5: fps, n, t0 = n / (time.monotonic() - t0), 0, time.monotonic()
-            prev = targets
+            history.append(targets)
             self.frameReady.emit({"image": img, "src": src, "targets": targets, "fov": fov, "size": frame.shape[1::-1],
                                   "assist": assist, "colors": cfg["colors"], "ms": ms, "fps": fps, "cap_fps": self.cap.fps})
 
@@ -199,15 +209,31 @@ class Engine(QThread):
 
 
 # ── Drawing shared by the preview and the on-screen overlay ──────────────────
-def draw_targets(p, targets, to_px, cfg, colors, overlay=False):
+PROBE_AT = QPointF(6, 6)       # self-test mark: top-left corner of the overlay and of the preview (logical px)
+
+
+def draw_probe(p, at, window):
+    """Two 8×8 patches: green|magenta on the overlay, magenta|green in the window (see detect.find_probes)."""
+    a, b = (QColor(255, 0, 255), QColor(0, 255, 0)) if window else (QColor(0, 255, 0), QColor(255, 0, 255))
+    p.setPen(Qt.NoPen); p.fillRect(QRectF(at.x(), at.y(), 8, 8), a); p.fillRect(QRectF(at.x() + 8, at.y(), 8, 8), b)
+
+
+SAFE = QColor("#ffffff")      # what the overlay draws in when screen capture can see it: colourless, so never detected
+
+
+def draw_targets(p, targets, to_px, cfg, colors, overlay=False, safe=False):
+    """safe: the capture can see the overlay, so draw only in white/black (detection needs colour) and skip the red glow."""
     mode, th = cfg["mode"], cfg["thickness"]
     if mode == "none": return
     f = QFont("Geist Mono"); f.setPixelSize(11); f.setBold(True); p.setFont(f)
+    if safe and mode == "glow": mode = "box"
     for t in targets:
         c = colors[t.cls] if t.cls < len(colors) else colors[0]
-        col = QColor(c["box"])
+        col = SAFE if safe else QColor(c["box"])
         r = to_px(QRectF(t.x, t.y, t.w, t.h)).adjusted(-3, -3, 3, 3)
-        if mode in ("glow", "both") and overlay:
+        if safe:                                                 # dark edge so white shows on light backgrounds too
+            p.setPen(QPen(QColor(0, 0, 0, 200), th + 2)); p.setBrush(Qt.NoBrush); p.drawRoundedRect(r, 3, 3)
+        if mode in ("glow", "both") and overlay and not safe:
             g = cfg["glow"]
             for k in range(g, 0, -2):          # soft red halo outside the box
                 hc = QColor(255, 40, 40, int(150 * (1 - k / (g + 1)) ** 2))
@@ -231,12 +257,13 @@ def draw_targets(p, targets, to_px, cfg, colors, overlay=False):
             p.drawText(chip, Qt.AlignCenter, txt)
 
 
-LOCK = QColor("#00E5FF")
+LOCK_COLOUR = QColor("#00E5FF")
 
 
-def draw_lock(p, lock, to_px):
-    """NNMM: the box it's steering to (corner brackets + aim cross) and a line from the pointer to it."""
+def draw_lock(p, lock, to_px, safe=False):
+    """NNMM: the box it's steering to (corner brackets + aim cross) and a line from the pointer to it. safe: white only."""
     if not lock: return
+    LOCK = SAFE if safe else LOCK_COLOUR
     pt = lambda xy: to_px(QRectF(xy[0], xy[1], 0, 0)).topLeft()  # noqa: E731
     r = to_px(QRectF(*lock["box"])).adjusted(-7, -7, 7, 7)
     aim, cur = pt(lock["aim"]), pt(lock["cur"])
@@ -279,6 +306,7 @@ class Preview(QWidget):
         super().__init__()
         self.cfg, self.data, self.sampling, self.eyedrop = cfg, None, False, False
         self.live = None                         # NNMM controller, to draw what it has locked onto
+        self.probe = False                       # draw the self-test mark (can the capture see this window?)
         self.pixel = None                    # callable (x, y) -> (rgb, 11x11 RGB crop) | None, set by the window
         self.hover, self.paused = None, ""
         self.drag = None                     # ("sample", start QPointF, cur QPointF) | ("move"/"size", …)
@@ -354,6 +382,7 @@ class Preview(QWidget):
             p.setPen(QColor("#FFD25A")); p.drawText(r, Qt.AlignCenter, txt)
         if self.eyedrop and self.hover is not None and self.pixel and g.contains(self.hover):
             self._loupe(p, self.hover)
+        if self.probe: p.setClipping(False); draw_probe(p, PROBE_AT, window=True)
         if self.sampling or self.eyedrop:
             p.setPen(QPen(tok("accent"), 2)); p.setBrush(Qt.NoBrush); p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 14, 14)
         if self.sampling:
@@ -452,6 +481,8 @@ class Overlay(QWidget):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowTransparentForInput
                          | Qt.WindowDoesNotAcceptFocus | Qt.Tool)
         self.cfg, self.data, self.live = cfg, None, None
+        self.safe = False                 # screen capture can see this overlay: draw colourless (set by the self-test)
+        self.probe = False                # draw the self-test pattern
         self.setWindowTitle(OVERLAY_TITLE)
         self.setAttribute(Qt.WA_TranslucentBackground); self.setAttribute(Qt.WA_ShowWithoutActivating)
 
@@ -477,14 +508,15 @@ class Overlay(QWidget):
             if d.get("assist") is not None:
                 p.setRenderHint(QPainter.SmoothPixmapTransform, False); p.drawImage(to_px(QRectF(*d["fov"])), d["assist"])
             if cfg["overlay_fov"]: draw_fov(p, d["fov"], to_px, cfg, ring_pad=4)
-            draw_targets(p, d["targets"], to_px, cfg, d["colors"], overlay=True)
-            if self.live is not None: draw_lock(p, self.live.lock(), to_px)
+            draw_targets(p, d["targets"], to_px, cfg, d["colors"], overlay=True, safe=self.safe)
+            if self.live is not None: draw_lock(p, self.live.lock(), to_px, safe=self.safe)
             if cfg["overlay_fps"]:
                 f = QFont("Geist Mono"); f.setPixelSize(13); f.setBold(True); p.setFont(f)
                 txt = f"ChromaScope  {d['fps']:.0f} FPS  {len(d['targets'])} hits"
                 r = QRectF(14, 14, p.fontMetrics().horizontalAdvance(txt) + 20, 26)
                 p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 150)); p.drawRoundedRect(r, 7, 7)
                 p.setPen(QColor("#e8e8e8")); p.drawText(r, Qt.AlignCenter, txt)
+        if self.probe: draw_probe(p, PROBE_AT, window=False)
         p.end()
 
 
@@ -682,6 +714,9 @@ class Window(uv.Surface):
         self.b_hits, self.b_res = uv.Badge("0 hits", "success"), uv.Badge("—", "info")
         for b in (self.b_cap, self.b_proc, self.b_ms, self.b_hits, self.b_res): stats.addWidget(b)
         stats.addStretch(1)
+        self.b_self = uv.Badge("", "warn"); self.b_self.hide(); stats.addWidget(self.b_self)
+        self.probe_left, self.probe_hits, self.probe_win, self.probe_pending = 0, [0, 0], [], False
+        self.probe_timer = QTimer(self); self.probe_timer.setInterval(3000); self.probe_timer.timeout.connect(self.reprobe)
         self.mouse_sw = uv.Switch("NN mouse (F7)", False); self.mouse_sw.toggled.connect(self.set_live)
         self.mouse_sw.setToolTip("NNMM live mouse: steer the mouse onto the nearest detected box (settings on the NNMM tab)")
         stats.addWidget(self.mouse_sw)
@@ -1397,12 +1432,13 @@ class Window(uv.Surface):
 
     def set_overlay(self, on):
         self.cfg["overlay"] = on; save_settings(self.cfg)
-        if on: self.overlay.show_on(self.cfg["overlay_screen"])
+        if on: self.overlay.show_on(self.cfg["overlay_screen"]); self.probe_pending = self.running
         else: self.overlay.hide()
 
     def toggle(self):
         if self.running:
             self.engine.stop_capture(); self.engine = None; self.running = False; self.live.feed(None)
+            self.probe_timer.stop(); self.probe_left = 0; self.overlay.probe = self.preview.probe = False; self.b_self.hide()
             self.go.setText("Start capture"); self.set_status("Idle", "warn")
             self.preview.data = None; self.preview.paused = ""; self.preview.update(); self.overlay.data = None; self.overlay.update()
             if self.preview.eyedrop: self.stop_eyedrop()
@@ -1410,11 +1446,55 @@ class Window(uv.Surface):
             self.engine = Engine(self.cfg)
             self.engine.frameReady.connect(self.on_frame); self.engine.failed.connect(self.on_fail)
             self.engine.started_ok.connect(lambda: self.set_status("Live", "success")); self.engine.pausedChanged.connect(self.on_paused)
-            self.engine.start_capture(); self.running = True
+            self.engine.start_capture(); self.running = True; self.probe_pending = True
             self.go.setText("Stop capture"); self.set_status("Waiting for screen…", "info")
             if self.cfg["minimize"]: QTimer.singleShot(400, self.showMinimized)
         self.go.updateGeometry()
         if self.cfg["overlay"] and not self.overlay.isVisible(): self.set_overlay(True)
+
+    # ── self-test: does the capture see our own overlay / window? ───────────
+    # KWin rules normally hide both from the capture. Where that doesn't work (older KWin, X11, other desktops) the
+    # app would detect its own boxes and loop: boxes inside boxes that shrink and grow. So it checks for itself.
+    def start_probe(self, frames=14):
+        self.probe_left, self.probe_hits, self.probe_win = frames, [0, 0], []
+        self.overlay.probe = self.overlay.isVisible(); self.preview.probe = True
+        self.overlay.update(); self.preview.update()
+
+    def reprobe(self):
+        """While the window is seen by the capture, find it again now and then (it may have moved)."""
+        if self.running and self.engine.window_rect is not None and not self.probe_left: self.start_probe(6)
+
+    def check_probe(self):
+        if self.probe_pending: self.probe_pending = False; self.start_probe()
+        if not self.probe_left or self.engine is None or self.engine.last_frame is None: return
+        over, win = find_probes(self.engine.last_frame)
+        self.probe_hits[0] += over is not None; self.probe_hits[1] += win is not None
+        if win is not None: self.probe_win.append(win)
+        self.probe_left -= 1
+        if self.probe_left: return
+        self.overlay.probe = self.preview.probe = False; self.overlay.update(); self.preview.update()
+        if self.overlay.isVisible() or self.probe_hits[0]:
+            seen = self.probe_hits[0] >= 2
+            self.engine.overlay_seen = self.overlay.safe = seen
+        rect = None
+        if self.probe_hits[1] >= 2:                              # our window is in the frame: where, from the mark
+            w, h = self.engine.last_frame.shape[1::-1]
+            k = self.screen_map(w, h)[2]
+            mx, my = self.probe_win[-1]
+            o = self.preview.mapTo(self, PROBE_AT.toPoint())
+            pad_x, pad_top = 10 * k, 44 * k                      # window frame + title bar
+            rect = (int(mx - (o.x() + 4) * k - pad_x), int(my - (o.y() + 4) * k - pad_top),
+                    int(self.width() * k + 2 * pad_x), int(self.height() * k + pad_top + pad_x))
+        self.engine.window_rect = rect
+        self.probe_timer.start() if rect else self.probe_timer.stop()
+        notes = []
+        if self.overlay.safe: notes.append("overlay seen by capture: drawing in white")
+        if rect: notes.append("window seen by capture: ignoring it")
+        self.b_self.text = "  ·  ".join(notes); self.b_self.setVisible(bool(notes))
+        self.b_self.setToolTip("Screen capture can see ChromaScope's own drawings on this system (the KWin rule that hides them "
+                               "isn't working here), so it protects itself from detecting them. Minimizing ChromaScope while "
+                               "capturing also helps.")
+        self.b_self.updateGeometry(); self.b_self.update()
 
     def set_status(self, text, kind):
         self.status.text, self.status.kind = text, kind
@@ -1435,6 +1515,7 @@ class Window(uv.Surface):
         if self.engine.cap.restore_token and self.engine.cap.restore_token != self.cfg["restore_token"]:
             self.cfg["restore_token"] = self.engine.cap.restore_token; save_settings(self.cfg)
         self.preview.show_frame(d)
+        self.check_probe()
         self.live.feed(d)
         if self.overlay.isVisible():
             self.overlay.show_frame(d); self.engine.overlay_scale = self.overlay.scale()

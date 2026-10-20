@@ -42,7 +42,7 @@ def color_mask(hsv, c):
 
 def detect(frame, cfg, ignore=()):
     """frame: (h, w, 4) BGRx. Returns (targets, combined mask, fov_rect); the mask may be half-size for big areas. `ignore` = frame rects (x, y, w, h, band)
-    whose outline band our own overlay drew and must not be detected (fallback if KWin can't hide the overlay)."""
+    whose outline band our own overlay drew and must not be detected (fallback if KWin can't hide the overlay); band < 0 = the whole rect."""
     H, W = frame.shape[:2]
     fx, fy, fw, fh = fov_rect(cfg, W, H)
     k = 2 if fw * fh > 500_000 else 1         # big areas (full screen): work at half resolution, ~4x faster
@@ -57,7 +57,8 @@ def detect(frame, cfg, ignore=()):
     if ignore:
         keep = np.full((fh, fw), 255, np.uint8) if keep is None else keep
         for (x, y, w, hh, band) in ignore:
-            cv2.rectangle(keep, ((x - fx) // k, (y - fy) // k), ((x - fx + w) // k, (y - fy + hh) // k), 0, max(1, band // k))
+            cv2.rectangle(keep, ((x - fx) // k, (y - fy) // k), ((x - fx + w) // k, (y - fy + hh) // k), 0,
+                          -1 if band < 0 else max(1, band // k))      # band < 0: the whole rect (e.g. our own window)
 
     merge = cfg["merge"] // k
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (merge * 2 + 1,) * 2) if merge > 0 else None
@@ -148,3 +149,27 @@ def assist_layer(mask, style, rgb, max_w=960):
     r, g, b = rgb
     out[m > 0] = (b * a // 255, g * a // 255, r * a // 255, a)
     return out
+
+
+# ── Self-test: can the screen capture see our own overlay / window? ──────────
+def find_probes(frame):
+    """Look for the self-test marks (two 8×8 patches side by side, pure green and pure magenta). The overlay draws
+    green|magenta, the window magenta|green. Returns (overlay mark position, window mark position) in frame px of the
+    left patch's centre, or None where not found."""
+    f = frame[::2, ::2, :3].astype(np.int16)                 # half resolution is plenty for 8×8 patches
+    B, G, R = f[..., 0], f[..., 1], f[..., 2]
+    green = ((G > 170) & (R < 100) & (B < 100)).astype(np.uint8)
+    magenta = ((R > 170) & (B > 150) & (G < 100)).astype(np.uint8)
+
+    def blobs(m):
+        n, _lab, st, cen = cv2.connectedComponentsWithStats(m, connectivity=8)
+        return [(cen[i], st[i, 4]) for i in range(1, n) if 6 <= st[i, 4] <= 400]
+
+    over = win = None
+    for gc, ga in blobs(green):
+        for mc, ma in blobs(magenta):
+            dx, dy = mc[0] - gc[0], abs(mc[1] - gc[1])
+            if dy < 3 and 2 <= abs(dx) <= 20 and 0.4 < ga / ma < 2.5:
+                if dx > 0: over = (float(gc[0] * 2), float(gc[1] * 2))   # green left: the overlay's mark
+                else: win = (float(mc[0] * 2), float(mc[1] * 2))         # magenta left: the window's mark
+    return over, win
