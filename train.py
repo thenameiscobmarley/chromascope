@@ -1,8 +1,8 @@
-"""Builds the bundled NNMM model (models/aim.npz): a small network learns to steer a cursor onto moving dots.
+"""Makes a plain example NNMM model (a .npz to choose in the NNMM tab): a small network learns to steer a cursor onto moving dots.
 
 Synthetic training: one moving dot, one virtual cursor, and a simple teacher that aims a little ahead of the dot.
 The network drives the cursor itself while it learns (so it also learns to recover from its own mistakes), and its
-error against the teacher trains it with Adam on mean squared error. Run:  .venv/bin/python train.py [steps]
+error against the teacher trains it with Adam on mean squared error. Run:  .venv/bin/python train.py OUT.npz [steps]
 """
 from __future__ import annotations
 
@@ -138,7 +138,9 @@ class Sim:
 
 
 def main():
-    steps = int(sys.argv[1]) if len(sys.argv) > 1 else 120_000
+    if len(sys.argv) < 2: sys.exit("usage: train.py OUT.npz [steps]")
+    out = Path(sys.argv[1])
+    steps = int(sys.argv[2]) if len(sys.argv) > 2 else 120_000
     rng = np.random.default_rng(7)
     cfg = {"nn_hidden": 16, "nn_layers": 2, "nn_lr": 0.003, "nn_train": True, "nn_driver": "net",
            "nn_speed": 35, "nn_turns": 30, "nn_size": 3}
@@ -152,8 +154,8 @@ def main():
     h0, m0 = sim.hits, sim.misses
     for _ in range(20_000): sim.step()
     print(f"loss {sim.loss:.5f}  evaluation: {sim.hits - h0} hits, {sim.misses - m0} misses")
-    nnio.save(Path(__file__).parent / "models", "aim", sim.net)
-    print("wrote models/aim.npz")
+    nnio.save(out.parent, out.stem, sim.net)
+    print(f"wrote {out.parent / (out.stem + '.npz')}")
 
 
 if __name__ == "__main__":

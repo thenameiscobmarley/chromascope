@@ -67,18 +67,6 @@ def save(folder: Path, name, net, act="tanh"):
              **{f"W{i}": w for i, w in enumerate(net.W)}, **{f"b{i}": v for i, v in enumerate(net.b)})
 
 
-def names(folder: Path):
-    return sorted({p.stem for p in folder.iterdir() if p.suffix in (".npz", ".onnx")}) if folder.is_dir() else []
-
-
-def find(folders, name):
-    """The model file for a name: .npz preferred over .onnx, first folder wins."""
-    for f in folders:
-        for ext in (".npz", ".onnx"):
-            if (f / f"{name}{ext}").exists(): return f / f"{name}{ext}"
-    return None
-
-
 def _natural(k): return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", k)]
 
 

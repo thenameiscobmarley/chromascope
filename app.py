@@ -14,8 +14,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
+from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QInputDialog,
                                QLabel, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -29,8 +29,6 @@ from inputwatch import RightButton
 from extras import EXAMPLES, CursorWatcher, FocusWatcher, LockWatcher, Tour, UndoStack
 
 CONFIG = Path.home() / ".config" / "chromascope"
-MODELS = CONFIG / "models"                                    # imported models
-MODEL_DIRS = [MODELS, Path(__file__).resolve().parent / "models"]   # + the bundled ones (aim)
 PROFILES = CONFIG / "profiles"
 PROFILES.mkdir(parents=True, exist_ok=True)
 SETTINGS = CONFIG / "settings.json"
@@ -48,7 +46,7 @@ DEFAULTS = {
     "pause_locked": True, "pause_static": False, "pause_static_s": 30, "pause_focus": False, "focus_match": "",
     "history": [], "contrast_a": "#1a1917", "contrast_b": "#f4f2ee",
     "kit": "win98", "theme": "paper", "profile": "", "toured": False,
-    "nn_model": "aim", "nn_hold": "both", "nn_color": "",
+    "nn_model_path": "", "nn_aim_mode": "pointer", "nn_hold": "both", "nn_color": "",
 }
 # what a profile stores: everything about what to find and how to draw it, not window/capture/theme settings
 PROFILE_KEYS = ["colors", "sel", "min_area", "merge", "max_targets", "sort", "fov", "fov_shape", "fov_dx", "fov_dy",
@@ -60,7 +58,7 @@ RESET_KEYS = {"Detect": ["colors", "sel", "tolerance", "min_sat", "min_val", "mi
               "Draw": ["mode", "thickness", "glow", "labels", "hud", "assist", "assist_style", "assist_color"],
               "Setup": ["overlay_fov", "overlay_fps", "overlay_screen", "source", "cursor", "minimize",
                         "pause_locked", "pause_static", "pause_static_s", "pause_focus", "focus_match"],
-              "NNMM": ["nn_model", "nn_hold", "nn_color"]}
+              "NNMM": ["nn_aim_mode", "nn_hold", "nn_color"]}
 PRESETS = [("Red", "#ff2a2a"), ("Orange", "#ff8a00"), ("Yellow", "#ffe100"), ("Green", "#22e35a"),
            ("Cyan", "#00e5ff"), ("Blue", "#2a6bff"), ("Purple", "#b13cff"), ("Magenta", "#ff2ad4")]
 BOX_COLORS = [("Red", "#ff3b3b"), ("Lime", "#7CFF4F"), ("White", "#ffffff"), ("Cyan", "#2ae6ff"), ("Gold", "#ffc83a"), ("Pink", "#ff4fd8")]
@@ -91,7 +89,6 @@ def load_settings():
     except Exception: raw = {}
     cfg = {**DEFAULTS, **{k: v for k, v in raw.items() if k in DEFAULTS}}
     fix_colors(cfg, raw)
-    if cfg["nn_model"] in ("sandbox", "teacher"): cfg["nn_model"] = "aim"     # the old sandbox choices are gone
     return cfg
 
 
@@ -653,7 +650,7 @@ class Window(uv.Surface):
         self.lock = LockWatcher(); self.lock.changed.connect(lambda _l: self.update_pause())
         self.focus = FocusWatcher(CONFIG); self.focus.changed.connect(lambda *_: self.update_pause())
         self.cursor = CursorWatcher(CONFIG)
-        self.live = nnmm.Live(self.cfg, MODEL_DIRS, self.cursor, self.screen_map, self); self.live.changed.connect(self.show_live)
+        self.live = nnmm.Live(self.cfg, self.cursor, self.screen_map, self); self.live.changed.connect(self.show_live)
         self.rbutton = RightButton(self.cfg["nn_hold"]); self.rbutton.held.connect(self.on_right)
 
         root = QVBoxLayout(self); root.setContentsMargins(22, 14, 22, 16); root.setSpacing(12)
@@ -914,20 +911,22 @@ class Window(uv.Surface):
     def page_nnmm(self):
         p = Panel(self.cfg, self.changed, self.reg)
         p.section("Neural-network mouse")
-        p.lay.addWidget(label("Load a model, start capture, turn this on, then hold right click: the model moves the mouse onto the "
-                              "nearest detected box. Let go to stop.", 11, muted=True))
-        row = QHBoxLayout(); row.addWidget(label("Model", 13)); row.addStretch(1)
-        self.model_box = QComboBox(); self.model_box.setMinimumWidth(200); self.fill_models()
-        self.model_box.activated.connect(lambda _i: self.pick_model(self.model_box.currentData()))
-        row.addWidget(self.model_box); p.lay.addLayout(row)
+        p.lay.addWidget(label("Choose a model file, start capture, turn this on, then hold right click: the model moves the mouse "
+                              "onto the nearest detected box. Let go to stop. Nothing is built in.", 11, muted=True))
+        row = QHBoxLayout(); row.addWidget(label("Model file", 13)); row.addStretch(1)
+        self.model_name = label(self.model_text(), 12, mono=True); row.addWidget(self.model_name); p.lay.addLayout(row)
         row = QHBoxLayout(); row.setSpacing(4)
-        for text, fn in (("Load model (.npz)…", self.import_model), ("Open models folder", self.open_models)):
+        for text, fn in (("Choose model file…", self.choose_model), ("Clear", self.clear_model)):
             b = uv.Button(text, size="sm"); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(1); p.lay.addLayout(row)
         self.model_msg = label(getattr(self, "model_note_text", "Aim-trainer models (expert-…) run with their own estimator and "
                                                                 "snap/track brain; plain models take 6 inputs (target offset, target speed, current speed) "
-                                                                "and give 2 (speed x/y). OpenCV DNN runs the network either way."), 11, muted=True)
+                                                                "and give 2 (speed x/y). OpenCV DNN runs the network either way. The file is used "
+                                                                "where it is, not copied."), 11, muted=True)
         p.lay.addWidget(self.model_msg)
+        p.choice("Aim with", "nn_aim_mode", [("Pointer (2D)", "pointer"), ("Crosshair (3D)", "crosshair")])
+        p.lay.addWidget(label("Pointer: the mouse pointer goes onto the box (desktop, 2D). Crosshair: for 3D games, the camera turns "
+                              "until the box is at the screen centre; needs an aim-trainer model. Every hold starts fresh.", 11, muted=True))
         p.lay.addSpacing(6)
         row = QHBoxLayout(); row.addWidget(label("Go for", 13)); row.addStretch(1)
         self.nn_colour_box = QComboBox(); self.nn_colour_box.setMinimumWidth(200); self.fill_nn_colours()
@@ -937,13 +936,13 @@ class Window(uv.Surface):
         self.live_sw = uv.Switch("Enable (F7)", self.live.on); self.live_sw.toggled.connect(self.set_live); p.lay.addWidget(self.live_sw)
         self.live_msg = label(self.live.status, 12, mono=True); self.live_msg.setWordWrap(True); p.lay.addWidget(self.live_msg)
         self.input_msg = label(self.input_text(), 11, muted=True); p.lay.addWidget(self.input_msg)
-        p.end(lambda: (self.reset_tab("NNMM"), setattr(self.rbutton, "mode", self.cfg["nn_hold"]))); return p
+        p.end(lambda: (self.reset_tab("NNMM"), setattr(self.rbutton, "mode", self.cfg["nn_hold"]), self.live.mode_changed())); return p
 
     # ── NNMM ─────────────────────────────────────────────────────────────────
-    def fill_models(self):
-        b = self.model_box; b.blockSignals(True); b.clear()
-        for n in sorted({n for f in MODEL_DIRS for n in nnio.names(f)}): b.addItem(n, n)
-        i = b.findData(self.cfg["nn_model"]); b.setCurrentIndex(max(0, i)); b.blockSignals(False)
+    def model_text(self):
+        path = self.cfg["nn_model_path"]
+        if not path: return "none chosen"
+        return Path(path).name + ("" if Path(path).is_file() else "  (missing)")
 
     def fill_nn_colours(self):
         """'Go for' list: any colour, or one of the Detect tab's colours (stored by name, so reordering doesn't break it)."""
@@ -962,13 +961,15 @@ class Window(uv.Surface):
         self.model_note_text = text
         if hasattr(self, "model_msg"): self.model_msg.setText(text)
 
-    def pick_model(self, name):
-        self.cfg["nn_model"] = name; save_settings(self.cfg)
-        if self.live.on and not self.live.load_model(): self.set_live(False)
-        self.show_live()
+    def set_model_path(self, path):
+        self.cfg["nn_model_path"] = path; save_settings(self.cfg)
+        if hasattr(self, "model_name"): self.model_name.setText(self.model_text())
+        if self.live.on and (not path or not self.live.load_model()): self.set_live(False)
+        self.live.mode_changed(); self.show_live()
 
-    def import_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import model", str(Path.home()), "Models (*.npz *.onnx)")
+    def choose_model(self):
+        start = self.cfg["nn_model_path"] or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(self, "Choose model file", start, "Models (*.npz *.onnx)")
         if not path: return
         try:
             if nnio.is_aimer(path): m = nnio.CvPolicy(path)      # aim-trainer model: runs with the aimer/ runtime
@@ -977,13 +978,12 @@ class Window(uv.Surface):
                 if bad: raise ValueError(bad)
         except Exception as e:  # noqa: BLE001 - show why (format, shape, OpenCV, doesn't steer)
             self.model_note(f"Can't use that model: {e}"[:240]); return
-        MODELS.mkdir(parents=True, exist_ok=True); dst = MODELS / Path(path).name
-        dst.write_bytes(Path(path).read_bytes())
-        self.fill_models(); self.model_box.setCurrentIndex(self.model_box.findData(dst.stem)); self.pick_model(dst.stem)
-        self.model_note(f"Imported {dst.name} ({m.layers or 'ONNX'}); OpenCV runs it and it steers towards targets.")
+        self.set_model_path(path)
+        kind = "aim-trainer model" if nnio.is_aimer(path) else "plain model"
+        self.model_note(f"{Path(path).name}: {kind}, {m.layers or 'ONNX'}. OpenCV loaded it.\n{path}")
 
-    def open_models(self):
-        MODELS.mkdir(parents=True, exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(MODELS)))
+    def clear_model(self):
+        self.set_model_path(""); self.model_note("No model: it won't move until you choose one.")
 
     def input_text(self):
         mode = self.cfg["nn_hold"]
@@ -1366,6 +1366,7 @@ class Window(uv.Surface):
         if key == "overlay_screen" and self.overlay.isVisible(): self.overlay.show_on(self.cfg["overlay_screen"])
         if key.startswith("pause_") or key == "focus_match": self.update_pause()
         if key == "nn_hold": self.rbutton.mode = self.cfg["nn_hold"]; self.show_live()
+        if key == "nn_aim_mode": self.live.mode_changed(); self.show_live()
         save_settings(self.cfg); self.preview.update(); self.overlay.update()
         if not self.restoring and key in UNDO_KEYS + ["tolerance", "min_sat", "min_val", "fov"]: self.undo_timer.start()
 

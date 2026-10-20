@@ -3,11 +3,12 @@ decides how to move, and a virtual uinput mouse moves the pointer, while right c
 
 The nearest box becomes the model's 6 inputs (where the target is from the pointer, how the target moves, how the
 pointer moves; in screen heights) and the model outputs the pointer's next velocity (1.0 = top speed). The pointer's
-real position comes from KWin, 120 times a second. The bundled model models/aim.npz is made by train.py.
+real position comes from KWin, 120 times a second. The model is always a file the user chose; nothing is built in.
 """
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -38,15 +39,16 @@ class Live(QObject):
     changed = Signal()
     lockChanged = Signal()                                       # the locked-on box appeared, moved or went away (redraw)
 
-    def __init__(self, cfg, folders, cursor, screen_map, parent=None):
+    def __init__(self, cfg, cursor, screen_map, parent=None):
         super().__init__(parent)
-        self.cfg, self.folders = cfg, folders                     # model folders, searched in order
+        self.cfg = cfg                                            # cfg["nn_model_path"]: the model file the user chose
         self.cursor, self.screen_map = cursor, screen_map          # screen_map(frame w, h) -> (screen x, y, frame px per px, height)
         self.timer = QTimer(self); self.timer.setInterval(8); self.timer.timeout.connect(self.tick)
         self.mouse, self.model, self.on, self.held, self.ratio = None, None, False, False, 1.0
         self.aimer = None                                         # aim-trainer runtime, when the model is one of those
         self.status, self.counts, self.frames, self.targets = "Off", 0, 0, 0
         self.map, self.box, self.colour_note = None, None, ""      # last frame's screen map; locked box (frame px)
+        self.cur_frame = None                                      # where the "crosshair" was last frame (frame px)
         self.lose()
 
     def lose(self):
@@ -61,25 +63,38 @@ class Live(QObject):
         try: self.mouse = self.mouse or VirtualMouse()
         except OSError as e:
             self.status = f"Can't create the virtual mouse ({e.strerror}). Run ./setup.sh once."; self.changed.emit(); return False
-        self.on = True; self.lose(); self.cursor.start(); self.timer.start()
+        self.on = True; self.lose(); self.mode_changed()
         self.status = "Ready: hold right click to move the mouse"; self.changed.emit(); return True
 
+    @property
+    def crosshair(self): return self.cfg["nn_aim_mode"] == "crosshair"
+
+    def mode_changed(self):
+        """Pointer mode needs the pointer position (KWin) and, for plain models, the 120 Hz steering timer."""
+        self.lose()
+        if self.aimer is not None: self.aimer.reset()
+        if self.on and not self.crosshair: self.cursor.start()
+        else: self.cursor.stop()
+        if self.on and not self.crosshair and self.aimer is None: self.timer.start()
+        else: self.timer.stop()
+
     def stop(self, why="Off"):
-        self.on = False; self.lose(); self.cursor.stop(); self.timer.stop(); self.status = why
+        self.on = False; self.mode_changed(); self.status = why
         if self.mouse: self.mouse.close(); self.mouse = None
         self.changed.emit()
 
     def set_held(self, down):
         self.held = down; self.lose()
-        if self.aimer is not None and down: self.aimer.brain.est.have[:] = False   # new hold: fresh target, keep the learned sensitivity
+        if self.aimer is not None and down: self.aimer.reset()   # every hold starts fresh: nothing learned earlier carries over
         if self.on and not down: self.status = "Ready: hold right click to move the mouse"; self.changed.emit()
 
     def load_model(self):
-        name = self.cfg["nn_model"]
-        path = nnio.find(self.folders, name)
+        path = self.cfg["nn_model_path"]
+        name = Path(path).name if path else ""
         self.aimer = None
+        if not path: self.status = "No model chosen. Use “Choose model file…” first."; return False
         try:
-            if path is None: raise FileNotFoundError("file not found")
+            if not Path(path).is_file(): raise FileNotFoundError(f"{path} doesn't exist")
             if nnio.is_aimer(path):
                 # Aim-trainer model: its own estimator + snap/track brain, the network (run by OpenCV) corrects the plan.
                 # whole_counts: uinput only takes whole counts, the runtime carries the rest itself.
@@ -104,10 +119,11 @@ class Live(QObject):
 
     def lock(self):
         """What it's locked onto, in frame px, for drawing: {"box", "aim", "cur", "dist"} or None."""
-        if self.box is None or self.map is None or self.cursor.at is None: return None
-        sx, sy, k = self.map
-        cur = ((self.cursor.at[0] - sx) * k, (self.cursor.at[1] - sy) * k)
-        return {"box": self.box, "aim": tuple(self.aim), "cur": cur, "dist": float(np.hypot(self.aim[0] - cur[0], self.aim[1] - cur[1])) / k}
+        if self.box is None or self.map is None or self.cur_frame is None: return None
+        k, cur = self.map[2], self.cur_frame
+        if not self.crosshair and self.cursor.at is not None:     # pointer: draw from where it is right now
+            sx, sy, k = self.map; cur = ((self.cursor.at[0] - sx) * k, (self.cursor.at[1] - sy) * k)
+        return {"box": self.box, "aim": tuple(self.aim), "cur": tuple(cur), "dist": float(np.hypot(self.aim[0] - cur[0], self.aim[1] - cur[1])) / k}
 
     def feed(self, d, why=""):
         """Per frame (d = Engine frame dict, None when capture stopped / paused): the nearest box becomes the goal, in desktop px."""
@@ -117,13 +133,24 @@ class Live(QObject):
         if not (self.on and self.held): return
         if d is None: self.lose(); self.why = why or "capture isn't running"; return
         w, h = d["size"]
-        sx, sy, k, _sh = self.screen_map(w, h)
-        self.map = (sx, sy, k)
-        if self.cursor.at is None: self.goal, self.why = None, "waiting for the pointer position from KWin"; return
-        cur = np.array([(self.cursor.at[0] - sx) * k, (self.cursor.at[1] - sy) * k])
+        if self.crosshair:                                         # 3D: the crosshair is the screen centre, the camera turns
+            if self.aimer is None:
+                self.lose(); self.say("Crosshair (3D) needs an aim-trainer model (expert-….npz)"); return
+            self.map, cur = (0, 0, 1.0), np.array([w / 2, h / 2])
+        else:                                                      # 2D: the pointer is the crosshair
+            sx, sy, k, sh = self.screen_map(w, h)
+            if abs(w / h - (w / k) / sh) > 0.03:
+                self.lose(); self.say("Holding: the captured screen isn't the one picked in Setup → Monitor (sizes differ)"); return
+            self.map = (sx, sy, k)
+            if self.cursor.at is None: self.goal, self.why = None, "waiting for the pointer position from KWin"; return
+            cur = np.array([(self.cursor.at[0] - sx) * k, (self.cursor.at[1] - sy) * k])
+        self.cur_frame = cur
         boxes = [(np.array([t.x + t.w / 2, t.y + t.h / 2]), t) for t in targets]
         if not boxes:
-            self.lose(); self.why = "nothing detected" + (f" in {self.cfg['nn_color']}" if self.cfg["nn_color"] and not self.colour_note else ""); return
+            if self.aimer is not None: self.aim_step(d, None, cur)   # it was trained for targets that drop out for a while
+            self.lose(); self.why = "nothing detected" + (f" in {self.cfg['nn_color']}" if self.cfg["nn_color"] and not self.colour_note else "")
+            if self.aimer is not None: self.say(f"Holding right click · {self.why}")
+            return
         ref = self.aim if self.aim is not None else cur              # keep following the same box while it's there
         p, t = min(boxes, key=lambda q: np.hypot(*(q[0] - ref)))
         if self.aim is not None and np.hypot(*(p - ref)) > h * 0.12: p, t = min(boxes, key=lambda q: np.hypot(*(q[0] - cur))); self.goal = None
@@ -136,22 +163,26 @@ class Live(QObject):
         self.goal, self.t_goal = goal, now
 
     def aim_step(self, d, t, cur):
-        """Aim-trainer runtime, once per frame. The pointer plays the crosshair: the target is given relative to it,
-        around the screen centre, so moving the pointer shifts the target like turning a camera would. The runtime works
-        out how far a count moves the pointer (KDE's acceleration included) by itself, like a game's sensitivity."""
+        """Aim-trainer runtime, once per frame; t = the chosen box, or None when nothing is visible this frame.
+        Crosshair (3D): the target as seen, the crosshair is the screen centre, exactly how the runtime was trained.
+        Pointer (2D): the target relative to the pointer, around the screen centre, so moving the pointer shifts it like a
+        camera turn would. Either way the runtime works out how far a count moves things (sensitivity, acceleration)."""
         w, h = d["size"]
         sx, sy, k = self.map
-        W, H = w / k, h / k                                      # desktop px
-        at = np.array(self.cursor.at, float) - (sx, sy)
-        tx, ty = sx + (t.x + t.w / 2) / k, sy + (t.y + t.h / 2) / k
-        xy = (tx - sx - at[0] + W / 2, ty - sy - at[1] + H / 2)
-        bw, bh = t.w / k, t.h / k
-        out = self.aimer.step_target(xy, True, max(1.0, float(np.sqrt(bw * bh / np.pi))), (bw, bh), W, H)
+        W, H = w / k, h / k                                      # crosshair: frame px; pointer: desktop px
+        if t is None:
+            out = self.aimer.step_target((W / 2, H / 2), False, None, None, W, H)
+            xy = None
+        else:
+            xy = ((t.x + t.w / 2 - cur[0]) / k + W / 2, (t.y + t.h / 2 - cur[1]) / k + H / 2)
+            bw, bh = t.w / k, t.h / k
+            out = self.aimer.step_target(xy, True, max(1.0, float(np.sqrt(bw * bh / np.pi))), (bw, bh), W, H)
         ix, iy = self.mouse.move(*np.clip(out.counts, -400, 400))
         self.aimer.applied((ix, iy)); self.counts += abs(ix) + abs(iy)
+        if xy is None: return
         st = self.aimer.status()
         dist = float(np.hypot(xy[0] - W / 2, xy[1] - H / 2))
-        self.say(f"Moving ({self.model.name}, {st.get('mode', '…')}) · {dist:.0f} px from target"
+        self.say(f"Moving ({self.model.name}, {st.get('mode', '…')}, delay {st.get('delay', 0)}) · {dist:.0f} px from target"
                  + (f" · {self.colour_note}" if self.colour_note else ""))
 
     def tick(self):
