@@ -56,6 +56,7 @@ class Live(QObject):
         # from our own moves, and the aimer is stepped every latency/3 s: it always sees about 3 frames of delay.
         self.step_iv, self.lat = cfg["nn_step_ms"] / 1000, deque(maxlen=7)   # saved from last time; 67 ms (15/s) at first
         self.t_step, self.lat_probe, self.step_next = None, None, None
+        self.sent_log = deque(maxlen=64)                           # (time, counts) of recent moves, for watch_latency
         self.reached, self.slowed, self.dmin, self.unseen = False, 0, None, 0   # overshoot guard (see aim_step)
         self.since_best = np.zeros(2)                              # counts sent since the closest approach (to undo)
         self.lose()
@@ -109,8 +110,8 @@ class Live(QObject):
             if not Path(path).is_file(): raise FileNotFoundError(f"{path} doesn't exist")
             if kit.is_kit(path):
                 # Kit network (aim-trainer kit/: aim4 … aim6): brain2 + the v2 setup + deadzone, on top of its base model.
-                base = self.cfg["nn_base_path"] or kit.find_base(path)
-                if not base or not Path(base).is_file():
+                base = (self.cfg["nn_base_path"] or kit.find_base(path)) if kit.needs_base(path) else ""
+                if kit.needs_base(path) and (not base or not Path(base).is_file()):
                     raise FileNotFoundError("it's a kit network and needs its base model.npz (Choose model file… asks for it)")
                 self.aimer = kit.KitAimer(path, base, nnio.to_onnx, whole_counts=True, fire="hold")
                 self.model = self.aimer
@@ -216,10 +217,14 @@ class Live(QObject):
         elif len(self.lat) >= 3: self.step_next = iv              # faster is fine: from the next hold on
 
     def start_probe_timer(self, now, t, counts, W):
-        """Time this move if it should visibly shift the target (≥ 10 px by the aimer's own sensitivity estimate)."""
+        """Time this move if it should visibly shift the target (≥ 10 px by the aimer's own sensitivity estimate) and
+        the view was quiet before it: with earlier moves still in flight, their shift shows first and the lag would be
+        measured far too short (an aimer that sends a steady stream of small moves, like the kit networks)."""
         b = self.aimer.brain
         if not hasattr(b, "G") or self.aimer.status().get("confidence", 0) < 1: return
+        recent = sum(np.hypot(*c) for tc, c in self.sent_log if now - tc < 0.25)
         expect = float(b.G[0] * np.hypot(*counts) * W / 2)
+        if recent * b.G[0] * W / 2 > 0.15 * expect: return       # earlier moves would still be landing
         if expect >= 10: self.lat_probe = (now, np.array([t.x + t.w / 2, t.y + t.h / 2]), np.asarray(counts, float), expect)
 
     def aim_step(self, d, t, cur):
@@ -244,6 +249,7 @@ class Live(QObject):
         ix, iy = self.mouse.move(*np.clip(out.counts, -400, 400))
         self.aimer.applied((ix, iy)); self.counts += abs(ix) + abs(iy); self.since_best += (ix, iy)
         if self.crosshair and t is not None and self.lat_probe is None and (ix or iy): self.start_probe_timer(now, t, (ix, iy), W)
+        if ix or iy: self.sent_log.append((now, (ix, iy)))
         if xy is None:
             self.unseen += 1
             if self.crosshair and self.dmin is not None and self.unseen * self.step_iv > 1.0: self.overshoot()   # spun away

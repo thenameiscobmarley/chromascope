@@ -204,6 +204,33 @@ def unpack(x):
                 W3oo=f(W3[:OLD_H, :5]), W3no=f(W3[OLD_H:H, :5]), W3k=f(W3[:H, 5:]), b3=f(W3[H]), setup=setup)
 
 
+FULL_FORMAT = "kit-aimnet-full-1"
+_NET_KEYS = ("W1o", "W1e", "W1n", "b1", "W2oo", "W2no", "W2n", "b2", "W3oo", "W3no", "W3k", "b3")
+
+
+def export_full(x, path):
+    """every weight of a network in one file (both hidden layers in full: the copied model.npz units and the
+    new ones, the 17 heads and the 5 setup dials), numbers only: it loads without model.npz"""
+    net = unpack(x)
+    tmp = path + ".tmp.npz"
+    np.savez(tmp, format=np.array(FULL_FORMAT), sizes=np.array([OLD_IN, IN, OLD_H, H, OUT]),
+             **{k: net[k] for k in _NET_KEYS}, setup=net["setup"])
+    os.replace(tmp, path)
+
+
+def load_file(path):
+    """a network file -> the net dict NetRow uses: a full export (self-contained) or a trained-weights vector
+    file ("p", rebuilt on top of model.npz)"""
+    with np.load(path, allow_pickle=False) as d:
+        if "format" in d.files:
+            if str(d["format"]) != FULL_FORMAT or list(d["sizes"]) != [OLD_IN, IN, OLD_H, H, OUT]:
+                raise ValueError("%s is a different network layout (%s %s)" % (path, d["format"], list(d["sizes"])))
+            net = {k: np.ascontiguousarray(d[k], np.float32) for k in _NET_KEYS}
+            net["setup"] = np.clip(np.asarray(d["setup"], float), 0.0, 1.0)
+            return net
+        return unpack(np.asarray(d["p"], float))
+
+
 def forward(net, z):
     """z (n, IN) float32 -> (outputs (n, OUT), hidden 1, hidden 2)"""
     z = np.asarray(z, np.float32)
@@ -262,8 +289,10 @@ class NetRow:
     Its 5 setup dials (net["setup"], 0 = the current code) set the v2 setup per game."""
 
     def __init__(self, x):
-        x = np.asarray(x, float)
-        self.net = unpack(x)
+        """x: a trained-weights vector, a net dict (unpack / load_file), or a network file path"""
+        if isinstance(x, str):
+            x = load_file(x)
+        self.net = x if isinstance(x, dict) else unpack(np.asarray(x, float))
         self.setup = self.net["setup"]
         self.last = None
         self.prev = None

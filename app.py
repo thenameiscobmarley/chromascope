@@ -1016,7 +1016,10 @@ class Window(uv.Surface):
         if not path: return
         base = ""
         try:
-            if kit.is_kit(path):                                 # kit network: needs the model.npz it was trained on
+            if kit.is_kit(path) and not kit.needs_base(path):    # kit network, full export: everything in one file
+                m = kit.KitAimer(path, "", nnio.to_onnx)
+                kind, layers = "kit network (full)", "77 → 256 → 256 → 17"
+            elif kit.is_kit(path):                               # kit network, trained weights: needs its base model.npz
                 base = str(kit.find_base(path) or "")
                 if not base:
                     base, _ = QFileDialog.getOpenFileName(self, f"{Path(path).name} is a kit network: choose its base model.npz",

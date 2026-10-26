@@ -2,9 +2,10 @@
 weights on top of a base model.npz) driving brain2 with the v2 setup, the two-zone deadzone always on (as in the
 trainer's range). Same calls as aimer.Aimer: step_target / applied / reset / status.
 
-A kit file only holds what training moved: the network is its base model's weights + those changes, so it needs the
-exact model.npz it was trained on (the trainer's own model.npz, 57 -> 128 -> 128 -> 5). The network itself runs in
-OpenCV DNN (the same maths as aimnet.forward, as one MatMul/Add/Tanh graph).
+Two kinds of kit file: a full export (x_full.npz, aimnet.export_full: every weight, loads on its own) and a
+trained-weights vector (x.npz, "p"), which is rebuilt on top of the exact model.npz it was trained on (the trainer's
+own model.npz, 57 -> 128 -> 128 -> 5). The network itself runs in OpenCV DNN (the same maths as aimnet.forward, as one
+MatMul/Add/Tanh graph).
 """
 from pathlib import Path
 
@@ -20,9 +21,17 @@ SL = slice(0, 1)
 
 
 def is_kit(path):
-    """a kit network file: one flat vector "p" of trained weights"""
+    """a kit network file: a full export, or one flat vector "p" of trained weights"""
     if Path(path).suffix != ".npz": return False
-    with np.load(path, allow_pickle=False) as z: return "p" in z.files and "pi0" not in z.files
+    with np.load(path, allow_pickle=False) as z: return is_full_z(z) or ("p" in z.files and "pi0" not in z.files)
+
+
+def is_full_z(z): return "format" in z.files and str(z["format"]).startswith("kit-aimnet-full")
+
+
+def needs_base(path):
+    """a trained-weights vector needs its base model.npz; a full export doesn't"""
+    with np.load(path, allow_pickle=False) as z: return not is_full_z(z)
 
 
 def find_base(net_path):
@@ -76,16 +85,17 @@ class KitAimer(Aimer):
     """runtime2.Aimer2: brain2 + a kit network + the deadzone, for one aimer."""
 
     def __init__(self, net_path, base_path, onnx, **kw):
-        bad = check_base(base_path)
-        if bad: raise ValueError(f"base model {Path(base_path).name}: {bad}")
-        aimnet.MODEL, aimnet._W0 = str(base_path), None            # the weights the kit file was trained on top of
+        if needs_base(net_path):
+            if not base_path: raise FileNotFoundError("this kit file holds only trained weights and needs its base model.npz")
+            bad = check_base(base_path)
+            if bad: raise ValueError(f"base model {Path(base_path).name}: {bad}")
+            aimnet.MODEL, aimnet._W0 = str(base_path), None        # the weights the kit file was trained on top of
         super().__init__(None, **kw)
-        x = np.load(net_path, allow_pickle=False)["p"]
-        aimnet.full(x)                                             # raises if the vector fits none of the layouts
-        self.row = CvRow(x, onnx)
+        net = aimnet.load_file(str(net_path))                       # full export as is, or the vector on its base
+        self.row = CvRow(net, onnx)
         self.use_model = True
         self.brain = KitBrain(1)
-        self.name, self.base = Path(net_path).stem, Path(base_path)
+        self.name, self.base = Path(net_path).stem, (Path(base_path) if base_path and needs_base(net_path) else None)
 
     def reset(self):
         self.brain.reset(np.ones(1, bool))
