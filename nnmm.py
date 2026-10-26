@@ -16,6 +16,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 import nnio
 from aimer.runtime import Aimer
+from aimkit import kit
 from vmouse import VirtualMouse
 
 VMAX = 1.2                      # top speed the model was trained with, screen heights / s
@@ -106,6 +107,14 @@ class Live(QObject):
         if not path: self.status = "No model chosen. Use “Choose model file…” first."; return False
         try:
             if not Path(path).is_file(): raise FileNotFoundError(f"{path} doesn't exist")
+            if kit.is_kit(path):
+                # Kit network (aim-trainer kit/: aim4 … aim6): brain2 + the v2 setup + deadzone, on top of its base model.
+                base = self.cfg["nn_base_path"] or kit.find_base(path)
+                if not base or not Path(base).is_file():
+                    raise FileNotFoundError("it's a kit network and needs its base model.npz (Choose model file… asks for it)")
+                self.aimer = kit.KitAimer(path, base, nnio.to_onnx, whole_counts=True, fire="hold")
+                self.model = self.aimer
+                return True
             if nnio.is_aimer(path):
                 # Aim-trainer model: its own estimator + snap/track brain, the network (run by OpenCV) corrects the plan.
                 # whole_counts: uinput only takes whole counts, the runtime carries the rest itself. fire="hold": its

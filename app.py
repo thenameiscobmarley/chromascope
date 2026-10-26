@@ -27,6 +27,7 @@ from capture import MONITOR, WINDOW, Capture
 from detect import assist_layer, detect, find_probes, fov_rect, hsv_of, sample, tint
 import nnio
 import nnmm
+from aimkit import kit
 from inputwatch import RightButton
 from extras import EXAMPLES, CursorWatcher, FocusWatcher, LockWatcher, Tour, UndoStack
 
@@ -48,7 +49,7 @@ DEFAULTS = {
     "pause_locked": True, "pause_static": False, "pause_static_s": 30, "pause_focus": False, "focus_match": "",
     "history": [], "contrast_a": "#1a1917", "contrast_b": "#f4f2ee",
     "kit": "win98", "theme": "paper", "profile": "", "toured": False,
-    "nn_model_path": "", "nn_aim_mode": "pointer", "nn_hold": "both", "nn_color": "", "nn_step_ms": 66.7,
+    "nn_model_path": "", "nn_base_path": "", "nn_aim_mode": "pointer", "nn_hold": "both", "nn_color": "", "nn_step_ms": 66.7,
 }
 # what a profile stores: everything about what to find and how to draw it, not window/capture/theme settings
 PROFILE_KEYS = ["colors", "sel", "min_area", "merge", "max_targets", "sort", "fov", "fov_shape", "fov_dx", "fov_dy",
@@ -1013,19 +1014,30 @@ class Window(uv.Surface):
         start = self.cfg["nn_model_path"] or str(Path.home())
         path, _ = QFileDialog.getOpenFileName(self, "Choose model file", start, "Models (*.npz *.onnx)")
         if not path: return
+        base = ""
         try:
-            if nnio.is_aimer(path): m = nnio.CvPolicy(path)      # aim-trainer model: runs with the aimer/ runtime
+            if kit.is_kit(path):                                 # kit network: needs the model.npz it was trained on
+                base = str(kit.find_base(path) or "")
+                if not base:
+                    base, _ = QFileDialog.getOpenFileName(self, f"{Path(path).name} is a kit network: choose its base model.npz",
+                                                          str(Path(path).parent), "Base model (model.npz *.npz)")
+                    if not base: self.model_note("A kit network needs the base model.npz it was trained on."); return
+                m = kit.KitAimer(path, base, nnio.to_onnx)
+                kind, layers = "kit network", f"77 → 256 → 256 → 17 on base {Path(base).name} ({base})"
+            elif nnio.is_aimer(path):
+                m = nnio.CvPolicy(path); kind, layers = "aim-trainer model", m.layers   # runs with the aimer/ runtime
             else:
                 m = nnio.CvModel(path); bad = m.check()
                 if bad: raise ValueError(bad)
+                kind, layers = "plain model", m.layers or "ONNX"
         except Exception as e:  # noqa: BLE001 - show why (format, shape, OpenCV, doesn't steer)
             self.model_note(f"Can't use that model: {e}"[:240]); return
+        self.cfg["nn_base_path"] = base
         self.set_model_path(path)
-        kind = "aim-trainer model" if nnio.is_aimer(path) else "plain model"
-        self.model_note(f"{Path(path).name}: {kind}, {m.layers or 'ONNX'}. OpenCV loaded it.\n{path}")
+        self.model_note(f"{Path(path).name}: {kind}, {layers}. OpenCV loaded it.\n{path}")
 
     def clear_model(self):
-        self.set_model_path(""); self.model_note("No model: it won't move until you choose one.")
+        self.cfg["nn_base_path"] = ""; self.set_model_path(""); self.model_note("No model: it won't move until you choose one.")
 
     def input_text(self):
         mode = self.cfg["nn_hold"]
