@@ -32,6 +32,7 @@ from inputwatch import RightButton
 from extras import EXAMPLES, CursorWatcher, FocusWatcher, LockWatcher, Tour, UndoStack
 
 CONFIG = Path.home() / ".config" / "chromascope"
+REPO_MODELS = Path(__file__).resolve().parent / "models"     # models shipped in the repo (chosen, never loaded by themselves)
 PROFILES = CONFIG / "profiles"
 PROFILES.mkdir(parents=True, exist_ok=True)
 SETTINGS = CONFIG / "settings.json"
@@ -1011,7 +1012,7 @@ class Window(uv.Surface):
         self.live.mode_changed(); self.show_live()
 
     def choose_model(self):
-        start = self.cfg["nn_model_path"] or str(Path.home())
+        start = self.cfg["nn_model_path"] or str(REPO_MODELS)        # the models that come with ChromaScope
         path, _ = QFileDialog.getOpenFileName(self, "Choose model file", start, "Models (*.npz *.onnx)")
         if not path: return
         base = ""
